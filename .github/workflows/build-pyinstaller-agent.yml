@@ -30,7 +30,7 @@ jobs:
 
       - name: Build EXE with PyInstaller (console)
         run: |
-          pyinstaller --onefile --console main.py
+          pyinstaller --onefile --console agent.py
 
       - name: Upload built EXE as artifact
         uses: actions/upload-artifact@v4
