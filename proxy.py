@@ -72,13 +72,24 @@ class Agent:
                 logging.warning("agent=%s ping_loop_failed closing_connection", self.token)
 
                 self.writer.close()
-                await self.writer.wait_closed()
+                try:
+                    await self.writer.wait_closed()
+                except OSError:
+                    # The connection was reset; wait_closed() re-raises the
+                    # transport error. Swallow it so this task does not end in a
+                    # failed state and blow up whoever awaits it later.
+                    pass
 
                 break
 
     async def stop_ping_pong(self):
+        if self.task_ping_pong is None:
+            return
+
         self.task_ping_pong.cancel()
-        await self.task_ping_pong
+        # The ping loop may already have failed (e.g. the agent connection was
+        # reset). Never let that exception escape into the caller.
+        await asyncio.gather(self.task_ping_pong, return_exceptions=True)
         self.task_ping_pong = None
 
 
@@ -140,20 +151,19 @@ class Context:
                 async with self.lock:
                     agent = self.agents.pop(0)
                     pool_size = len(self.agents)
-
-                await agent.stop_ping_pong()
-
-                if agent.reader.at_eof():
-                    logging.info("agent=%s state=zombie_discarded", agent.token)
-                    agent.writer.close()
-                    await agent.writer.wait_closed()
-                    continue
-
-                logging.info("agent=%s state=assigned remaining_pool=%d", agent.token, pool_size)
-                return agent
-
             except IndexError:  # no agents left.
                 return None
+
+            await agent.stop_ping_pong()
+
+            if agent.reader.at_eof() or agent.writer.is_closing():
+                logging.info("agent=%s state=zombie_discarded", agent.token)
+                agent.writer.close()
+                await asyncio.gather(agent.writer.wait_closed(), return_exceptions=True)
+                continue
+
+            logging.info("agent=%s state=assigned remaining_pool=%d", agent.token, pool_size)
+            return agent
 
 
 context = Context()
@@ -579,7 +589,17 @@ async def handle_client(
     agent = None
 
     for attempt in range(wait_agent_max_tries):
-        agent = await context.pop_agent()
+        try:
+            agent = await context.pop_agent()
+        except Exception:
+            logging.exception(
+                "client=%s pop_agent_failed attempt=%d/%d",
+                format_peer(client_peername),
+                attempt + 1,
+                wait_agent_max_tries,
+            )
+            agent = None
+
         if agent:
             break
 
