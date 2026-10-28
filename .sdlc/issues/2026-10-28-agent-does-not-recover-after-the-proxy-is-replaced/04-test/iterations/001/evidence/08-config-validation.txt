@@ -1,0 +1,9 @@
+## agent --control-idle-timeout 0
+agent.py: error: argument --control-idle-timeout: must be > 0 and <= 300
+exit=2
+## proxy --ready-timeout 0
+proxy.py: error: argument --ready-timeout: must be > 0 and <= 300
+exit=2
+## proxy --pool-report-interval -1
+proxy.py: error: argument --pool-report-interval: must be >= 0 and <= 300
+exit=2

@@ -14,7 +14,23 @@ env:
   IMAGE_NAME: ${{ github.repository }}-proxy
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+
+      - name: Run tests
+        run: python -m unittest discover -v
+
   build:
+    needs: test
     runs-on: ubuntu-latest
 
     permissions:

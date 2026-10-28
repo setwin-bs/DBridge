@@ -17,10 +17,7 @@ How to run the two processes in this repository — the proxy (`proxy.py`) and t
 repository root unless stated otherwise; the toolchain is Python 3.14 asyncio, with no
 third-party dependency.
 
-Rows marked **new** or **changed** belong to the change in progress
-(`.sdlc/issues/2026-10-28-agent-does-not-recover-after-the-proxy-is-replaced/02-design/iterations/001/spec.md`)
-and describe the behaviour after it is deployed. Everything unmarked was verified against
-`6f1fec7`. Flags and environment variables are listed in full in
+Flags and environment variables are listed in full in
 [configuration.md](configuration.md).
 
 ## CLI & scripts
@@ -35,7 +32,7 @@ and describe the behaviour after it is deployed. Everything unmarked was verifie
 | `docker build -f Dockerfile.agent -t dbridge-agent .` | Build the agent image (`python:3.14-alpine`, `CMD python agent.py`) | `docker build -f Dockerfile.agent -t dbridge-agent .` |
 | `docker compose up -d` | Start the four dev databases defined in `docker-compose.yml` | `docker compose up -d mysql` |
 | `docker compose down` | Stop them; `-v` also deletes their volumes | `docker compose down -v` |
-| `python -m unittest -v` | Discover and run `test*.py` from the repository root | `python -m unittest -v` |
+| `python -m unittest discover -v` | Discover and run `test*.py` from the repository root | `python -m unittest discover -v` |
 | `python -m unittest -v test_proxy` | Run a single test module | `python -m unittest -v test_proxy` |
 | `pyinstaller dbridge_agent.spec` | Build the one-file `dbridge_agent` Windows executable from the committed spec | `pyinstaller dbridge_agent.spec` |
 
@@ -52,7 +49,7 @@ not handled and kills the process without running that path.
 | Port | Flag / variable | Purpose |
 |---|---|---|
 | 3130 | `-l/--port-liveness`, `PORT_LIVENESS` | Plain-TCP liveness probe |
-| 4260 | `-r/--port-readiness`, `PORT_READINESS` | Readiness probe — plain text today, **changed** to HTTP `200`/`503` by the change in progress |
+| 4260 | `-r/--port-readiness`, `PORT_READINESS` | Readiness probe — HTTP `200` with body `ready` / `503` with body `not ready` |
 | 7000 | `-a/--port-agents`, `PORT_AGENTS` | Agent control connections (raw TCP, 16-byte token handshake) |
 | 9000 | `-p/--port-clients`, `PORT_CLIENTS` | Client data connections (raw TCP) |
 
@@ -63,15 +60,17 @@ A typical development run that keeps the proxy off the default ports and admits 
 $ python proxy.py -x 127.0.0.1 -a 17000 -p 19000 -l 13130 -r 14260 -q 127.0.0.1 -i 127.0.0.1
 ```
 
-Logging is `logging.basicConfig` at `--log-level` (default `INFO`). **Changed**: each line is
+Logging is `logging.basicConfig` at `--log-level` (default `INFO`). Each line is
 prefixed with a UTC timestamp and the level, format `%(asctime)s %(levelname)s %(message)s`
-with `time.gmtime`, and the pool reports `pool_size=N` on change and every
-`POOL_REPORT_INTERVAL_SECONDS`:
+with `time.gmtime`, and the pool reports its size on registration, assignment and discard,
+plus a periodic `pool_size=N` line every `POOL_REPORT_INTERVAL_SECONDS` (`0` disables the
+periodic line):
 
 ```text
 2026-10-28 10:34:57,120 INFO proxy_started host=0.0.0.0 agents_port=7000 clients_port=9000
-2026-10-28 10:35:12,004 INFO agent=6f1fec73-... state=registered peer=10.0.0.7:51234
-2026-10-28 10:35:12,004 INFO pool_size=1
+2026-10-28 10:35:12,004 INFO agent=3f9c2a7e-... state=registered peer=10.0.0.7:51234
+2026-10-28 10:35:12,005 INFO agent=3f9c2a7e-... pool_size=1
+2026-10-28 10:36:12,004 INFO pool_size=1
 ```
 
 The container image runs the same command; its `Dockerfile.proxy` exports the default
@@ -158,22 +157,26 @@ $ nc -w 2 127.0.0.1 3130
 🚀 alive and forwarding packets like a champ!
 ```
 
-### Readiness — `:4260`, HTTP (**changed**)
+### Readiness — `:4260`, HTTP
 
-Currently the port answers in plain text with no status line and no HTTP headers. After the
-change it is a minimal HTTP/1.1 endpoint: `200 OK` with body `ready` when the pool holds at
-least one agent, `503 Service Unavailable` with body `not ready` when it is empty.
+The port answers a minimal HTTP/1.1 request: `200 OK` with body `ready` when the pool holds at
+least one agent, `503 Service Unavailable` with body `not ready` when it is empty. It consumes
+the request up to `\r\n\r\n` (bounded at 2 s), so both `curl` and a bare TCP connect get an
+answer; the response carries `Content-Type: text/plain; charset=utf-8`,
+`Content-Length` and `Connection: close`.
 
 ```bash
 $ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:4260/
 200
+$ curl -s http://127.0.0.1:4260/
+ready
 ```
 
-An empty pool is a `503`, which removes the tenant from the Service endpoints — that is the
-intended signal (see [architecture.md](architecture.md)). The Kubernetes readiness probe becomes
-`httpGet` on port 4260; the chart lives in `setwin-bs/helm-charts`
-(`charts/dbridge/templates/deployment.yaml`) and is configured through `setwin-bs/argocd-apps`,
-so the manifest change ships from there, not from this repository.
+An empty pool is a `503` with body `not ready`, which removes the tenant from the Service
+endpoints — that is the intended signal (see [architecture.md](architecture.md)). The
+Kubernetes readiness probe must be `httpGet` on port 4260; the chart lives in
+`setwin-bs/helm-charts` (`charts/dbridge/templates/deployment.yaml`) and is configured through
+`setwin-bs/argocd-apps`, so the manifest change ships from there, not from this repository.
 
 ### Agent health — `:4000`, plain TCP, loopback only
 
@@ -185,35 +188,36 @@ $ nc -w 2 127.0.0.1 4000
 ## Tests
 
 The suite is `unittest`-based and needs no dependency beyond the standard library. It runs on
-Python 3.14 (`python:3.14-alpine` in both images; `test_proxy.py` uses `IsolatedAsyncioTestCase`).
+Python 3.14 (`python:3.14-alpine` in both images; both test modules use
+`IsolatedAsyncioTestCase`). `test_proxy.py` covers pool lifecycle, readiness `200`/`503`, the
+stale-`pong` skip, the `ready` timeout and the short handshake; `test_agent.py` covers the
+control-frame deadline and fragmentation, reconnect, close-before-replacement ordering, the
+jittered retry delay on timeout and EOF, bounded connection growth under repeated failures,
+keepalive on a real `StreamWriter`, and the `FORWARD_IDLE_TIMEOUT_SECONDS=0` data path.
 
 ```bash
-$ python -m unittest -v
-test_pop_agent_empty_pool_returns_none (test_proxy.AgentPoolLifecycleTest...) ... ok
-test_pop_agent_returns_healthy_registered_agent (test_proxy.AgentPoolLifecycleTest...) ... ok
-test_pop_agent_survives_agent_reset (test_proxy.AgentPoolLifecycleTest...) ... ok
-
+$ python -m unittest discover -v | tail -4
 ----------------------------------------------------------------------
-Ran 3 tests in 0.199s
+Ran 22 tests in 5.429s
 
 OK
 ```
 
-The reset test prints one `WARNING:root:agent=... ping_loop_failed closing_connection` line
-between its name and `ok`; it is the expected path, not a failure.
+The run is verbose and prints expected `WARNING`/`ERROR` lines from the failure-path tests
+(e.g. `agent=... ping_loop_failed closing_connection`, `state=control_timeout`,
+`bridge_aborted ... reason=agent_not_ready_timeout`); they are the expected paths, not
+failures.
 
-**New**: `test_agent.py` joins the suite with this change (control-read deadline, reconnect,
-`FORWARD_IDLE_TIMEOUT_SECONDS=0`, service-connection failure), and
-`.github/workflows/build-publish-proxy.yml` gains a `test` job that runs
-`python -m unittest -v` on Python 3.14 before the image build. The agent and PyInstaller
-workflows have no test job; only the proxy workflow does.
+`build-publish-proxy.yml` runs the same command in its `test` job on every push and pull
+request, and the image `build` job depends on it (`needs: test`). The agent and PyInstaller
+workflows still have no test job.
 
 ## Conventions
 
-- **No HTTP API.** The client (`:9000`) and agent (`:7000`) ports are raw TCP with a private
-  handshake — 16 bytes of token, then `ping`/`pong`/`connect`/`ready`. The only HTTP surface is
-  the readiness port (**changed**), documented above; there is nothing to authenticate or send a
-  JSON body to. See [architecture.md](architecture.md) for the protocol.
+- **No HTTP API beyond readiness.** The client (`:9000`) and agent (`:7000`) ports are raw TCP
+  with a private handshake — 16 bytes of token, then `ping`/`pong`/`connect`/`ready`. The only
+  HTTP surface is the readiness port, documented above; there is nothing to authenticate or
+  send a JSON body to. See [architecture.md](architecture.md) for the protocol.
 - **Signals and exit codes:** `0` after `SIGINT` (the `KeyboardInterrupt` handler closes the
   servers and pool); `2` for an `argparse` usage error — unknown flag,
   missing required `-x`/`-b` on the agent, or a value rejected by a validator; `1` for an

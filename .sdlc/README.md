@@ -204,7 +204,7 @@ lives in the repository, so filing it is starting it.
 
 | Issue | Slug | Phase | Status |
 |---|---|---|---|
-| 2026-10-28 | agent-does-not-recover-after-the-proxy-is-replaced | 03-build | spec 001 approved |
+| 2026-10-28 | agent-does-not-recover-after-the-proxy-is-replaced | 05-deploy | report 001 green |
 
 ## Configuration
 

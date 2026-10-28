@@ -1,0 +1,7 @@
+## readiness with one agent
+ready
+http=200
+## echo through the bridge
+hello
+## 30 s silent stream with FORWARD_IDLE_TIMEOUT_SECONDS=0
+silent_seconds=30.0 bridge_alive=yes

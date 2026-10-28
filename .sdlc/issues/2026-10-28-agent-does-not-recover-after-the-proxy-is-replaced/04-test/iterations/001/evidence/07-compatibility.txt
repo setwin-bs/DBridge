@@ -1,0 +1,14 @@
+## old proxy (HEAD) + new agent
+oldproxy-newagent
+agent=b822a809-fa5f-49c5-a801-c51254262bfa state=registered peer=127.0.0.1:49234
+## new proxy + old agent (HEAD)
+newproxy-oldagent
+2026-10-28 13:45:33,415 INFO agent=5929e66b-8ec4-4fcb-a98c-587d559ba98b state=registered peer=127.0.0.1:58032
+## old tcpSocket probe still passes against the HTTP readiness port
+Connection to 127.0.0.1 4285 port [tcp/*] succeeded!
+tcp_probe=ok
+/tmp/opencode/compat.sh: line 62: 28568 Killed                     python3 /tmp/opencode/old_proxy.py -l 3153 -r 4283 -a 7113 -p 9113 -u 5 -z 5 > /tmp/opencode/c-oldproxy.log 2>&1
+/tmp/opencode/compat.sh: line 62: 28571 Killed                     python3 agent.py -x 127.0.0.1 -p 7113 -e 4012 -d 127.0.0.1 -b 9999 -n 1 -r 0.5 --control-idle-timeout 20 -f 0 > /tmp/opencode/c-newagent.log 2>&1
+/tmp/opencode/compat.sh: line 62: 28589 Killed                     python3 proxy.py -l 3154 -r 4284 -a 7114 -p 9114 -u 5 --ready-timeout 2 -z 5 > /tmp/opencode/c-newproxy.log 2>&1
+/tmp/opencode/compat.sh: line 62: 28592 Killed                     python3 /tmp/opencode/old_agent.py -x 127.0.0.1 -p 7114 -e 4013 -d 127.0.0.1 -b 9999 -n 1 -r 0.5 > /tmp/opencode/c-oldagent.log 2>&1
+proxy still alive: yes

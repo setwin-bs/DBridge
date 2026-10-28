@@ -1,0 +1,10 @@
+## readiness with no agent
+not ready
+http=503
+## liveness is a plain TCP endpoint
+Connection to 127.0.0.1 3151 port [tcp/nm-assessor] succeeded!
+liveness=open
+## short handshake on the agents port
+short_handshake_tail= b''
+## proxy log for the short handshake (no traceback expected)
+2026-10-28 13:44:39,603 WARNING agent_peer=127.0.0.1:39538 handshake_failed reason=short_token bytes=3

@@ -1,0 +1,4 @@
+## client connected to an agent that never sends ready
+client_closed=yes elapsed=2.0s tail=b''
+## proxy log
+2026-10-28 13:45:16,278 ERROR bridge_aborted agent_token=8d95826e-f436-4c7d-8818-08e5db3d00a8 client_peer=127.0.0.1:52216 reason=agent_not_ready_timeout

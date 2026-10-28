@@ -1,0 +1,1995 @@
+diff --git a/.github/workflows/build-publish-proxy.yml b/.github/workflows/build-publish-proxy.yml
+index 5b79412..756345b 100644
+--- a/.github/workflows/build-publish-proxy.yml
++++ b/.github/workflows/build-publish-proxy.yml
+@@ -14,7 +14,23 @@ env:
+   IMAGE_NAME: ${{ github.repository }}-proxy
+ 
+ jobs:
++  test:
++    runs-on: ubuntu-latest
++
++    steps:
++      - name: Checkout repository
++        uses: actions/checkout@v7
++
++      - name: Set up Python
++        uses: actions/setup-python@v7
++        with:
++          python-version: "3.14"
++
++      - name: Run tests
++        run: python -m unittest discover -v
++
+   build:
++    needs: test
+     runs-on: ubuntu-latest
+ 
+     permissions:
+diff --git a/agent.py b/agent.py
+index d430d27..974030f 100644
+--- a/agent.py
++++ b/agent.py
+@@ -2,6 +2,8 @@ import os
+ import argparse
+ import asyncio
+ import logging
++import random
++import socket
+ import typing
+ import uuid
+ import ssl
+@@ -28,6 +30,90 @@ def writer_peer(writer: asyncio.StreamWriter | None) -> tuple[str, int] | None:
+     return transport.get_extra_info('peername')
+ 
+ 
++def configure_logging(level: str) -> None:
++    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(message)s")
++    logging.Formatter.converter = time.gmtime  # timestamps in UTC
++
++
++def reconnect_delay(base_seconds: float) -> float:
++    """Keep the configured retry delay and add jitter so agents never sync up."""
++    return base_seconds + random.uniform(0, 0.5)
++
++
++def enable_keepalive(
++    writer: asyncio.StreamWriter | None,
++    idle_seconds: int = 30,
++    interval_seconds: int = 10,
++    count: int = 3,
++) -> None:
++    """Best-effort OS keepalive; the application deadline is the real guarantee."""
++    if writer is None or writer.transport is None:
++        return
++
++    sock = writer.transport.get_extra_info("socket")
++    if sock is None:
++        return
++
++    # transport.get_extra_info("socket") is an asyncio TransportSocket wrapper,
++    # which does not expose ioctl(); the raw socket does.
++    raw = getattr(sock, "_sock", sock)
++
++    try:
++        raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
++
++        if hasattr(socket, "SIO_KEEPALIVE_VALS") and hasattr(raw, "ioctl"):  # Windows
++            raw.ioctl(
++                socket.SIO_KEEPALIVE_VALS,
++                (1, idle_seconds * 1000, interval_seconds * 1000),
++            )
++        elif hasattr(socket, "TCP_KEEPIDLE"):  # Linux
++            raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, idle_seconds)
++            raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, interval_seconds)
++            raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, count)
++
++    except (OSError, AttributeError, ValueError) as exc:
++        logging.debug("keepalive_not_tuned exception=%r", exc)
++
++
++async def close_writer(writer: asyncio.StreamWriter | None, timeout: float = 5.0) -> None:
++    """Close a writer without letting a dead peer wedge the caller."""
++    if writer is None:
++        return
++
++    writer.close()
++    try:
++        await asyncio.wait_for(writer.wait_closed(), timeout=timeout)
++    except (asyncio.TimeoutError, OSError):
++        pass
++
++
++async def read_control_frame(reader: asyncio.StreamReader, timeout: float) -> bytes:
++    """Read exactly one control frame (`ping` or `connect`) within the deadline.
++
++    Reads an exact prefix first: `read(n)` may return several frames at once, so a
++    buffered `ping` followed by `connect` must not be glued into `pingcon`.
++    """
++    loop = asyncio.get_running_loop()
++    deadline = loop.time() + timeout
++
++    remaining = deadline - loop.time()
++    if remaining <= 0:
++        raise asyncio.TimeoutError
++
++    head = await asyncio.wait_for(reader.readexactly(4), timeout=remaining)
++
++    if head == b"ping":
++        return head
++
++    if head == b"conn":
++        remaining = deadline - loop.time()
++        if remaining <= 0:
++            raise asyncio.TimeoutError
++        return head + await asyncio.wait_for(reader.readexactly(3), timeout=remaining)
++
++    return head
++
++
+ def parse(to: typing.Type[T], value: typing.Any, or_default: T | None = None) -> T | None:
+     if isinstance(value, to):
+         return value
+@@ -83,6 +169,16 @@ def validate_idle_timeout(value):
+         raise argparse.ArgumentTypeError("Invalid float value.") from exc
+ 
+ 
++def validate_control_idle_timeout(value):
++    try:
++        f_value = float(value)
++        if f_value <= 0 or f_value > 300:
++            raise argparse.ArgumentTypeError("must be > 0 and <= 300")
++        return f_value
++    except ValueError as exc:
++        raise argparse.ArgumentTypeError("Invalid float value.") from exc
++
++
+ def validate_log_level(value: str):
+     value = value.upper()
+     log_levels = logging.getLevelNamesMapping()
+@@ -106,7 +202,12 @@ def parse_args():
+ 
+     default_min_threads = parse(to=int, value=os.getenv("MIN_THREADS", os.cpu_count()), or_default=1)
+     default_retry_delay_seconds = parse(to=float, value=os.getenv("RETRY_DELAY_SECONDS"), or_default=1.0)
+-    default_forward_idle_timeout = parse(to=float, value=os.getenv("FORWARD_IDLE_TIMEOUT_SECONDS"), or_default=15.0)
++    default_forward_idle_timeout = parse(to=float, value=os.getenv("FORWARD_IDLE_TIMEOUT_SECONDS"), or_default=0.0)
++    default_control_idle_timeout = parse(
++        to=float,
++        value=os.getenv("CONTROL_IDLE_TIMEOUT_SECONDS"),
++        or_default=45.0,
++    )
+ 
+     default_log_level = os.getenv("LOG_LEVEL", "INFO")
+ 
+@@ -179,6 +280,17 @@ def parse_args():
+         ) % default_forward_idle_timeout,
+     )
+ 
++    parser.add_argument(
++        "--control-idle-timeout",
++        type=validate_control_idle_timeout,
++        default=default_control_idle_timeout,
++        help=(
++            "Seconds the agent waits for the proxy's next ping before closing the control "
++            "connection and reconnecting. Must be greater than the proxy's ping interval "
++            f"(default: {default_control_idle_timeout:.0f}s)."
++        ),
++    )
++
+     parser.add_argument(
+         "-v", "--log-level",
+         type=validate_log_level,
+@@ -266,8 +378,7 @@ async def forward(
+         )
+ 
+     finally:
+-        destination.close()
+-        await destination.wait_closed()
++        await close_writer(destination)
+ 
+     return total_bytes
+ 
+@@ -290,26 +401,46 @@ async def run_agent(
+     cert,
+     retry_delay_seconds,
+     forward_idle_timeout,
++    control_idle_timeout,
+     queue: asyncio.Queue,
+ ):
+     proxy_writer = None
+     svc_writer = None
++    replacement_queued = False
+ 
+-    new_agent_spawned = False
++    async def queue_replacement():
++        """Queue exactly one replacement for this control connection."""
++        nonlocal replacement_queued
++        if replacement_queued:
++            return
++        replacement_queued = True
++        await queue.put(1)
+ 
+     try:
+         ssl_context = ssl.create_default_context(cafile=cert) if use_ssl else None
+         proxy_reader, proxy_writer = await asyncio.open_connection(proxy_host, proxy_port, ssl=ssl_context)
++        enable_keepalive(proxy_writer)
++
+         proxy_peername = writer_peer(proxy_writer)
+         logging.info("agent=%s state=connected proxy=%s ssl=%s", token, format_peer(proxy_peername), bool(use_ssl))
+ 
+         proxy_writer.write(token.bytes)  # Send my identification
+         await proxy_writer.drain()
+ 
+-        data = None
+-
+         while True:
+-            data = await proxy_reader.read(7)
++            try:
++                data = await read_control_frame(proxy_reader, control_idle_timeout)
++            except asyncio.TimeoutError:
++                logging.warning(
++                    "agent=%s state=control_timeout idle_seconds=%.0f proxy=%s",
++                    token,
++                    control_idle_timeout,
++                    format_peer(proxy_peername),
++                )
++                return
++            except asyncio.IncompleteReadError:
++                logging.info("agent=%s state=closed_by_proxy proxy=%s", token, format_peer(proxy_peername))
++                return
+ 
+             if data != b"ping":
+                 break
+@@ -319,28 +450,24 @@ async def run_agent(
+ 
+         if data != b"connect":
+             logging.error("agent=%s handshake_failed payload=%r", token, data)
+-
+-            proxy_writer.close()
+-
+-            await asyncio.gather(
+-                proxy_writer.wait_closed(),
+-                asyncio.sleep(retry_delay_seconds),
+-                queue.put(1)  # Signal to spawn a new agent
+-            )
+-
+             return
+ 
+         logging.info("agent=%s bridge=preparing service=%s:%d", token, svc_host, svc_port)
+ 
+-        _, svc = await asyncio.gather(
+-            queue.put(1),  # Signal to spawn a new agent,
+-            asyncio.open_connection(svc_host, svc_port),
+-            return_exceptions=True
+-        )
+-
+-        new_agent_spawned = True
++        # Refill the pool before bridging: this connection is busy from now on.
++        await queue_replacement()
+ 
+-        svc_reader, svc_writer = svc
++        try:
++            svc_reader, svc_writer = await asyncio.open_connection(svc_host, svc_port)
++        except OSError as exc:
++            logging.error(
++                "agent=%s service_connection_failed service=%s:%d exception=%r",
++                token,
++                svc_host,
++                svc_port,
++                exc,
++            )
++            return
+ 
+         proxy_writer.write(b"ready")
+         await proxy_writer.drain()
+@@ -377,32 +504,27 @@ async def run_agent(
+                 format_peer(svc_peername),
+             )
+ 
+-            svc_writer.close()
+-            proxy_writer.close()
+-
+             await asyncio.gather(
+-                svc_writer.wait_closed(),
+-                proxy_writer.wait_closed(),
+-                return_exceptions=True
++                close_writer(svc_writer),
++                close_writer(proxy_writer),
+             )
++            return
+ 
+     except Exception as e:
+         logging.error("agent=%s connection_error exception=%r retry_delay=%.2fs", token, e, retry_delay_seconds)
+-        await asyncio.sleep(retry_delay_seconds)
+ 
+     finally:
+         logging.info("agent=%s state=closed", token)
+ 
+-        if proxy_writer:
+-            proxy_writer.close()
+-            # await proxy_writer.wait_closed()
+-
+-        if svc_writer:
+-            svc_writer.close()
+-            # await svc_writer.wait_closed()
++        # Close first: a failed connection must not stay open while its successor runs.
++        await close_writer(proxy_writer)
++        await close_writer(svc_writer)
+ 
+-        if not new_agent_spawned:
+-            await queue.put(1)  # Signal to spawn a new agent
++        if not replacement_queued:
++            # Failure before the bridge: back off before spawning the successor so
++            # consecutive failures cannot accumulate open connections.
++            await asyncio.sleep(reconnect_delay(retry_delay_seconds))
++            await queue_replacement()
+ 
+ 
+ async def spawn_agents(queue: asyncio.Queue, *args):
+@@ -433,7 +555,7 @@ async def shutdown(loop, health_server):
+ 
+ async def main():
+     args = parse_args()
+-    logging.basicConfig(level=args.log_level, format="%(message)s")
++    configure_logging(args.log_level)
+ 
+     loop = asyncio.get_running_loop()
+     queue = asyncio.Queue()
+@@ -458,6 +580,7 @@ async def main():
+                 args.cert,
+                 args.retry_delay_seconds,
+                 args.forward_idle_timeout,
++                args.control_idle_timeout,
+             )
+         )
+ 
+diff --git a/docs/architecture.md b/docs/architecture.md
+index dd0c646..34f6143 100644
+--- a/docs/architecture.md
++++ b/docs/architecture.md
+@@ -26,8 +26,9 @@ yet — see [ADR index](#adr-index).
+ ## Context
+ 
+ `proxy.py` listens on four ports: agents (`:7000`), clients (`:9000`), liveness (`:3130`) and
+-readiness (`:4260`). `agent.py` holds one control connection per concurrency slot, answers the
+-proxy's keepalive, and opens a local service connection when it is assigned a client. The pool is
++readiness (`:4260`). `agent.py` holds one control connection per concurrency slot, treats silence
++from the proxy as a lost connection after `CONTROL_IDLE_TIMEOUT_SECONDS`, answers the proxy's
++keepalive, and opens a local service connection when it is assigned a client. The pool is
+ memory-only: a new proxy process starts empty and waits for agents to register.
+ 
+ Non-goals: authenticating agents, parsing or rewriting SQL, persisting state, any user interface.
+@@ -40,16 +41,16 @@ flowchart LR
+     A -->|"TCP SERVICE_PORT"| S[("tenant database")]
+     A -->|"TCP :4000 health"| H["health check"]
+     K["Kubernetes probes"] -->|":3130 liveness"| P
+-    K -->|":4260 readiness"| P
++    K -->|":4260 HTTP readiness"| P
+ ```
+ 
+ ## Modules
+ 
+ | Module | Responsibility | Location | Depends on |
+ |---|---|---|---|
+-| Proxy process | Four listeners, agent registration, keepalive, pool, assignment, byte forwarding, optional TLS | `proxy.py` | Python stdlib only |
+-| Agent process | Outbound control connections, keepalive replies, service dial, byte forwarding, local health port | `agent.py` | Python stdlib only, the tenant service |
+-| Pool regression tests | `AgentPoolLifecycleTest`: assignment, reset during keepalive, empty pool | `test_proxy.py` | `proxy.py` |
++| Proxy process | Four listeners, agent registration, keepalive, pool, assignment, bounded `ready` wait, byte forwarding, HTTP readiness, optional TLS | `proxy.py` | Python stdlib only |
++| Agent process | Outbound control connections, control-frame deadline, OS keepalive, keepalive replies, service dial, byte forwarding, local health port | `agent.py` | Python stdlib only, the tenant service |
++| Regression tests | Pool lifecycle (`AgentPoolLifecycleTest`), readiness `200`/`503`, `ready` timeout and stale `pong`, short handshake, pool report (`test_proxy.py`); control timeout, control frames and replacement accounting, service failure, idle-timeout-off (`test_agent.py`) | `test_proxy.py`, `test_agent.py` | `proxy.py`, `agent.py` |
+ | Proxy image | `python:3.14-alpine`, one file, four exposed ports | `Dockerfile.proxy` | — |
+ | Agent image | `python:3.14-alpine`, one file, health port | `Dockerfile.agent` | — |
+ | Agent executable | PyInstaller one-file console build `agent.exe`, attached to a tag's GitHub Release | `.github/workflows/build-pyinstaller-agent.yml`; `dbridge_agent.spec` is the local equivalent, not used by CI | — |
+@@ -65,14 +66,19 @@ exist in both files with the same shape, and there is no shared package. `agent.
+   threads despite the `MIN_THREADS` / `--min-threads` name — it sizes a queue of agent tasks.
+ - The pool is `proxy.Context`, a module-level singleton: `agents: list[Agent]` plus an
+   `asyncio.Lock`. `Context.length()` reads it, `add_agent()` appends, `pop_agent()` takes from the
+-  front (FIFO) and `clean_zombies()` sweeps it.
++  front (FIFO), `clean_zombies()` sweeps it and `report_pool()` logs its size on an interval.
+ - Each `Agent` owns its token (`uuid.UUID`), the stream pair, `ping_pong_interval` and at most one
+   keepalive task. `pop_agent()` stops that task before handing the connection to a client.
+ - The agent's concurrency is an `asyncio.Queue` of spawn permits consumed by `spawn_agents`. `main()`
+   seeds `MIN_THREADS` permits; each permit creates one `run_agent` task, which is one control
+   connection.
+ - An agent connection serves at most one bridge. When the proxy sends `connect`, the agent queues
+-  a replacement connection before it opens the service, so a bridge does not reduce the idle count.
++  exactly one replacement connection before it opens the service, so a bridge does not reduce the
++  idle count. The same `replacement_queued` flag covers every other exit from `run_agent`, so a
++  failed handshake cannot queue a second one.
++- Socket teardown goes through `close_writer()`, which closes the writer and waits at most 5 s for
++  `wait_closed()`. Both processes carry it, so a dead peer cannot wedge the reconnect or shutdown
++  path.
+ 
+ ## Wire protocol
+ 
+@@ -80,8 +86,8 @@ All messages are unframed byte strings on the control connection.
+ 
+ | Step | Direction | Bytes | Meaning |
+ |---|---|---|---|
+-| Token | agent → proxy | 16 | `uuid.UUID.bytes`, written raw; the proxy reads 16 bytes and labels the connection `agent=<uuid>` |
+-| `ping` | proxy → agent | `ping` (4) | Keepalive, every `PING_PONG_INTERVAL_SECONDS` |
++| Token | agent → proxy | 16 | `uuid.UUID.bytes`, written raw; the proxy reads exactly 16 bytes and labels the connection `agent=<uuid>` |
++| `ping` | proxy → agent | `ping` (4) | Keepalive; the first goes out at registration, then every `PING_PONG_INTERVAL_SECONDS` |
+ | `pong` | agent → proxy | `pong` (4) | Expected within a hard-coded 5 s |
+ | `connect` | proxy → agent | `connect` (7) | Assignment: promote this connection to a bridge |
+ | `ready` | agent → proxy | `ready` (5) | The agent has connected to the local service |
+@@ -89,49 +95,68 @@ All messages are unframed byte strings on the control connection.
+ 
+ Notes that matter when changing either side:
+ 
+-- The proxy reads the token with `reader.read(16)`, not `readexactly`; the agent reads the next
+-  message with `proxy_reader.read(7)` — enough for `connect` — and compares the result to `b"ping"`
+-  and `b"connect"`. Short reads are not framed or retried.
++- The proxy reads the token with `reader.readexactly(16)` inside a 10 s bound. A short read logs
++  `handshake_failed reason=short_token bytes=N` at WARNING; a timeout or reset logs
++  `handshake_failed reason=handshake_error`. Both close the connection; no exception escapes the
++  connection handler.
++- The agent reads the next message with `read_control_frame()`: it reads exactly 4 bytes, returns
++  them when they are `ping`, and reads 3 more bytes only when the prefix is `conn`. A buffered
++  `ping` followed by `connect` is therefore read as two frames, and a fragmented `connect` still
++  arrives whole. Any other 4 bytes are returned as-is and handled as a handshake failure.
++- `read_control_frame()` applies one deadline to the whole frame (`CONTROL_IDLE_TIMEOUT_SECONDS`);
++  `await_ready()` on the proxy applies one deadline to the whole wait for `ready`
++  (`READY_TIMEOUT_SECONDS`). No control-phase read is unbounded.
+ - The token is an identifier, not a credential: the proxy accepts any 16 bytes that parse as a
+   UUID. The `ALLOWED_AGENTS` / `ALLOWED_CLIENTS` peer-IP allowlists (default `*`) are the only
+   admission check.
+ - `ping`/`pong` exists only while the connection sits in the pool. `pop_agent()` stops it, so the
+-  bridge phase has no keepalive at the application level.
++  bridge phase has no keepalive at the application level. A `pong` that was already in flight can
++  still be buffered when `connect` is written; `await_ready()` skips it.
+ - The keepalive is driven by the proxy only; the agent never initiates one.
+ 
+ ## Data flows
+ 
+ 1. **Registration.** The agent opens TCP to `PROXY_HOST:PROXY_PORT` (TLS when `USE_SSL` is set,
+    verified against `SSL_CERT` if given), logs `state=connected`, then writes its 16-byte token.
+-   The proxy's `handle_agent` checks the peer IP against `ALLOWED_AGENTS`, `Context.add_agent`
+-   reads the token, creates the `Agent`, starts the keepalive task and appends it to the pool
+-   (`state=registered`, `pool_size` at DEBUG).
+-2. **Keepalive.** Per agent, the proxy writes `ping`, waits at most 5 s for `pong`, then sleeps
+-   `PING_PONG_INTERVAL_SECONDS` (21 s by default) and repeats. A mismatch, timeout or socket error
+-   logs `ping_loop_failed closing_connection` and closes the connection.
++   The proxy's `handle_agent` checks the peer IP against `ALLOWED_AGENTS`; `Context.add_agent`
++   reads exactly 16 bytes within 10 s, creates the `Agent`, starts the keepalive task and appends
++   it to the pool. It logs `state=registered peer=...` and then `pool_size=N` at INFO. A short
++   handshake is logged at WARNING as `handshake_failed reason=short_token bytes=N` (or
++   `reason=handshake_error` for a stall/reset) and closed without registering anything.
++2. **Keepalive.** Per agent, the proxy writes `ping` as soon as the keepalive task starts, waits at
++   most 5 s for `pong` (`reader.read(4)`), then sleeps `PING_PONG_INTERVAL_SECONDS` (21 s by
++   default) and repeats. A mismatch, timeout or socket error logs
++   `ping_loop_failed closing_connection` and closes the connection.
+ 3. **Client connect and assignment.** The client arrives on `:9000`, the peer IP is checked against
+    `ALLOWED_CLIENTS`, and `handle_client` tries `Context.pop_agent()` up to
+    `WAIT_AGENT_MAX_TRIES` times with `WAIT_AGENT_RETRY_INTERVAL` between attempts (10 × 0.7 s,
+    ≈ 7 s). `pop_agent` skips entries whose reader is at EOF or whose writer is closing. When the
+    pool stays empty the client is closed and `no_agent_available` is logged; nothing is sent to it.
+-4. **Handshake.** The proxy writes `connect` on the assigned connection and waits for `ready`
+-   (see the timeout table for the current absence of a deadline). Only then does it start the
+-   bridge; a wrong reply closes both sides with `bridge_aborted reason=agent_not_ready` and the
+-   connection is not returned to the pool.
++4. **Handshake.** The proxy writes `connect` on the assigned connection and calls
++   `await_ready(agent.reader, READY_TIMEOUT_SECONDS)`. `await_ready` reads 4-byte frames, discards
++   a stale `pong` left over from a keepalive that was in flight when the task was stopped, and
++   accepts only `ready`. On expiry it logs `bridge_aborted ... reason=agent_not_ready_timeout`,
++   on EOF/reset `reason=agent_not_ready_closed`, and on any other reply
++   `reason=agent_not_ready`; in every case it closes the client and the agent connection with
++   bounded waits. The assigned connection is not returned to the pool; other
++   entries are untouched, and the agent already queued the replacement for that slot when it
++   received `connect`.
+ 5. **Bridge.** `handle_client` gathers two `proxy.forward()` loops — `client->agent` (client reader
+    to agent writer) and `agent->client` (agent reader to client writer) — with the proxy's
+-   `FORWARD_IDLE_TIMEOUT_SECONDS`. The agent, after sending `ready`, gathers `proxy->service`
+-   (proxy reader to service writer) and `service->proxy` (service reader to proxy writer) with its
+-   own `FORWARD_IDLE_TIMEOUT_SECONDS`. Each loop reads up to 4096 bytes, writes and drains; when one
+-   direction ends it closes its destination, which ends the other. Both sides log start, duration
+-   and per-direction byte counts.
+-6. **Refill and reconnect.** Before the agent sends `ready` it puts one permit on the spawn queue,
+-   so `spawn_agents` starts a replacement connection with a fresh token. If `run_agent` fails
+-   before that point — connect error, TLS error, handshake failure — it sleeps
+-   `RETRY_DELAY_SECONDS` and, in `finally`, puts a permit back only when it has not already done so.
+-   The new task always connects with a new UUID. The handshake-failure branch queues its own permit
+-   before returning and `finally` queues a second one (`new_agent_spawned` is still false), so one
+-   failed handshake starts two replacement connections.
++   `FORWARD_IDLE_TIMEOUT_SECONDS` (0, no cutoff, by default). The agent, after sending `ready`,
++   gathers `proxy->service` (proxy reader to service writer) and `service->proxy` (service reader
++   to proxy writer) with its own `FORWARD_IDLE_TIMEOUT_SECONDS`. Each loop reads up to 4096 bytes,
++   writes and drains; when one direction ends it closes its destination, which ends the other.
++   Both sides log start, duration and per-direction byte counts.
++6. **Refill and reconnect.** `queue_replacement()` sets `replacement_queued` and puts one permit on
++   the spawn queue, so each `run_agent` queues at most one replacement however it ends;
++   `spawn_agents` starts a new `run_agent` with a fresh UUID for each permit. A connect or TLS
++   error, a failed handshake, a control timeout, an EOF or a reset all end in `finally`, which
++   closes the failed socket, sleeps `RETRY_DELAY_SECONDS` plus `random.uniform(0, 0.5)` seconds
++   and only then queues the one replacement. A service-dial failure returns without a further
++   delay because its replacement was already queued when `connect` arrived. Closing before the
++   delay and queueing after it is what keeps repeated failures from accumulating open
++   connections.
+ 
+ ## Connection lifecycle and reconnection
+ 
+@@ -139,38 +164,56 @@ Notes that matter when changing either side:
+ stateDiagram-v2
+     [*] --> Connecting: spawn permit
+     Connecting --> WaitingForConnect: 16-byte token sent
+-    Connecting --> Reconnecting: connect or TLS error
++    Connecting --> Backoff: connect or TLS error
+     WaitingForConnect --> WaitingForConnect: ping / pong every 21 s
+     WaitingForConnect --> OpeningService: connect
+-    WaitingForConnect --> Reconnecting: socket closed, reset, or any other reply
++    WaitingForConnect --> Backoff: control_timeout / closed_by_proxy / unexpected frame
+     OpeningService --> Bridging: ready
+-    OpeningService --> Reconnecting: service connection raises
++    OpeningService --> Closed: service connection fails
+     Bridging --> Closed: both forward loops end
+-    Reconnecting --> [*]: RETRY_DELAY_SECONDS, then a new task
+-    Closed --> [*]: the replacement was queued at assignment
++    Backoff --> [*]: close, RETRY_DELAY_SECONDS + jitter, queue one replacement
++    Closed --> [*]: one replacement was already queued at connect
+ ```
+ 
+-The agent has no application-level deadline on the control read, so a connection that is silently
+-half-open (the peer is gone, no FIN and no RST reaches the host) stays in `WaitingForConnect`
+-until the socket itself reports EOF, reset or a TCP timeout. Detection of a replaced proxy
+-therefore depends on the tenant host receiving an error; when it does, the path above reconnects
+-after `RETRY_DELAY_SECONDS` with no human action.
++The agent applies `CONTROL_IDLE_TIMEOUT_SECONDS` (45 s by default) to the read that waits for the
++next `ping`. When the proxy is replaced and the socket goes silently half-open — no FIN and no RST
++reaches the host — the read expires and the agent logs
++`state=control_timeout idle_seconds=...` at WARNING. An EOF logs `state=closed_by_proxy`; a
++reset surfaces as `connection_error`. Every one of those paths closes the failed socket in
++`finally`, waits `RETRY_DELAY_SECONDS` plus 0–0.5 s of jitter, and then queues exactly one
++replacement, so a flapping proxy cannot multiply connections. As a kernel-level backstop,
++`enable_keepalive()`
++sets `SO_KEEPALIVE` and tunes it on a best-effort basis (Linux `TCP_KEEPIDLE=30`,
++`TCP_KEEPINTVL=10`, `TCP_KEEPCNT=3`; Windows `SIO_KEEPALIVE_VALS` idle 30 s, interval 10 s). A
++failed tuning is logged at DEBUG and never blocks the connection; the application deadline is the
++guarantee.
+ 
+ ## Failure behaviour
+ 
+ - **No agent available.** The client waits ≈ 7 s and is closed without a reply. The proxy logs
+   `no_agent_available`; the client sees the connection end.
+-- **Agent never sends `ready`.** The proxy blocks on `agent.reader.read(5)` with no deadline and
+-  holds both the client and the assigned connection. The slot is not returned to the pool, and
+-  neither side is closed until the socket dies or the agent replies.
+-- **Service connection fails.** The agent's `open_connection` result is unpacked although
+-  `return_exceptions=True` can put an exception there, so the failure surfaces as a `TypeError`
+-  from tuple unpacking, logged as `connection_error` and retried. The control connection is closed
+-  without `ready`.
+-- **Keepalive fails.** The proxy closes the socket. The agent's blocked read returns or raises; its
+-  next step is the handshake-failure branch, which closes, backs off and spawns a replacement.
+-- **Proxy restarts.** Every control connection ends at once; agents take the reconnect path. The
+-  new proxy starts with an empty pool and fills it only through registrations — there is no
++- **Agent never sends `ready`.** The proxy waits `READY_TIMEOUT_SECONDS` (30 s) in `await_ready`,
++  skipping a stale `pong`. On expiry it logs
++  `bridge_aborted ... reason=agent_not_ready_timeout`; an EOF or reset logs
++  `reason=agent_not_ready_closed`, and a wrong reply `reason=agent_not_ready`. In every case it
++  closes the client and the agent connection with bounded waits and leaves the rest of the pool
++  untouched. The assigned connection was already removed from the pool and is not put back; the
++  agent queued a replacement for the slot when it received `connect`.
++- **Service connection fails.** `asyncio.open_connection` raises `OSError`; the agent logs
++  `service_connection_failed service=host:port exception=<repr>` with the real exception, returns
++  without sending `ready`, and `finally` closes the control connection. The replacement was
++  already queued at assignment, so no second one is queued.
++- **Keepalive fails.** The proxy closes the socket. The agent's blocked control read gets EOF
++  (`state=closed_by_proxy`), a reset (`connection_error`) or the deadline (`state=control_timeout`).
++  In every case the failed socket is closed, the jittered delay elapses, and then one
++  replacement is queued.
++- **Short handshake.** A peer that sends fewer than 16 bytes is logged as
++  `handshake_failed reason=short_token bytes=N`; one that stalls for 10 s or resets is logged as
++  `handshake_failed reason=handshake_error`. Both are closed; nothing is registered and no
++  exception escapes the connection handler.
++- **Proxy restarts.** Every control connection ends at once; agents take the reconnect path. A
++  proxy that disappears without closing the sockets is detected by the 45 s deadline instead.
++  The new proxy starts with an empty pool and fills it only through registrations — there is no
+   handover of tokens or sessions.
+ - **Client disconnects mid-bridge.** The client→agent loop sees EOF, closes the agent writer, and
+   the agent's forwarding ends. The agent-side replacement connection was already queued.
+@@ -180,19 +223,26 @@ after `RETRY_DELAY_SECONDS` with no human action.
+ | Timer | Setting | Current value | Where |
+ |---|---|---|---|
+ | Keepalive interval | `PING_PONG_INTERVAL_SECONDS` | 21 s, validated `0 < x < 30` | `Agent.run_ping_pong` |
+-| Pong deadline | hard-coded | 5 s | `Agent.run_ping_pong` |
+-| Agent control read | none | — | `run_agent` (`proxy_reader.read(7)`) |
+-| Wait for `ready` | none | — | `handle_client` (`agent.reader.read(5)`) |
++| Pong deadline | hard-coded | 5 s | `Agent.run_ping_pong` (`reader.read(4)`) |
++| Agent control read | `CONTROL_IDLE_TIMEOUT_SECONDS` | 45 s, validated `0 < x ≤ 300` | `run_agent` (`read_control_frame`) |
++| Wait for `ready` | `READY_TIMEOUT_SECONDS` | 30 s, validated `0 < x ≤ 300` | `handle_client` (`await_ready`) |
++| Token handshake read | hard-coded | 10 s | `Context.add_agent` (`readexactly(16)`) |
++| Socket close wait | hard-coded | 5 s | `close_writer` in both files |
++| Readiness request read | hard-coded | 2 s | `handle_readiness` |
+ | Assignment wait | `WAIT_AGENT_MAX_TRIES` × `WAIT_AGENT_RETRY_INTERVAL` | 10 × 0.7 s ≈ 7 s | `handle_client` |
+ | Zombie sweep | `ZOMBIES_CLEAN_INTERVAL` | 0 (off) in code; 90 s in `Dockerfile.proxy` | `Context.clean_zombies` |
+-| Reconnect delay | `RETRY_DELAY_SECONDS` | 1.0 s, validated `0 < x ≤ 300` | `run_agent` |
+-| Data idle cutoff, proxy | `FORWARD_IDLE_TIMEOUT_SECONDS` | 300 s in code; 0 disables | `proxy.forward` |
+-| Data idle cutoff, agent | `FORWARD_IDLE_TIMEOUT_SECONDS` | 15 s in code; 0 disables | `agent.forward` |
+-
+-Neither Dockerfile sets `FORWARD_IDLE_TIMEOUT_SECONDS`, so the image defaults are the values
+-above. A data cutoff closes the destination of that direction, which ends the bridge; the bytes
+-already forwarded are not rolled back. Every other environment variable and flag is in
+-[configuration.md](configuration.md).
++| Pool report | `POOL_REPORT_INTERVAL_SECONDS` | 60 s, `0` disables | `Context.report_pool` |
++| Reconnect delay | `RETRY_DELAY_SECONDS` + jitter | 1.0 s + `random.uniform(0, 0.5)`, validated `0 < x ≤ 300` | `run_agent` (`reconnect_delay`) |
++| OS keepalive | hard-coded | Linux idle 30 s / interval 10 s / 3 probes; Windows idle 30 s / interval 10 s | `enable_keepalive` |
++| Data idle cutoff, proxy | `FORWARD_IDLE_TIMEOUT_SECONDS` | 0 (no cutoff) | `proxy.forward` |
++| Data idle cutoff, agent | `FORWARD_IDLE_TIMEOUT_SECONDS` | 0 (no cutoff) | `agent.forward` |
++
++Neither Dockerfile sets `FORWARD_IDLE_TIMEOUT_SECONDS`, `READY_TIMEOUT_SECONDS` or
++`POOL_REPORT_INTERVAL_SECONDS`, so the code defaults apply inside the images too. A data cutoff
++closes the destination of that direction, which ends the bridge; the bytes already forwarded are
++not rolled back. The reconnect delay applies to every failure before the bridge; a service-dial
++failure is the exception because its replacement was already queued at `connect`. Every other
++environment variable and flag is in [configuration.md](configuration.md).
+ 
+ ## Persistence and state
+ 
+@@ -206,7 +256,7 @@ it. The tenant side keeps no state either: each reconnect is a new connection wi
+ |---|---|---|---|---|
+ | Database clients (n8n in production) | in | raw TCP `:9000`, optional TLS | Carry database traffic | Closed after ≈ 7 s when the pool is empty |
+ | Tenant database service | out (from the agent) | raw TCP `SERVICE_PORT` | Serve the forwarded traffic | Agent logs, closes the control connection, retries |
+-| Kubernetes probes | in | TCP `:3130`, TCP `:4260` | Liveness, readiness | Both answer on connect regardless of pool state |
++| Kubernetes probes | in | TCP `:3130`, HTTP `:4260` | Liveness, readiness | Liveness answers on connect; readiness answers `503` when the pool is empty |
+ | Health check | in | TCP `localhost:4000` | Agent process liveness | Fixed greeting, no pool or bridge state |
+ | GitHub Actions | out (CI) | docker push to GHCR, cosign, release upload | Publish images and `agent.exe` | Workflow fails; no runtime impact |
+ 
+@@ -215,24 +265,37 @@ it. The tenant side keeps no state either: each reconnect is a new connection wi
+ | Endpoint | Process | Behaviour today |
+ |---|---|---|
+ | `:3130` liveness | proxy | Accepts, writes `🚀 alive and forwarding packets like a champ!`, closes. Plain TCP, no HTTP, no pool check |
+-| `:4260` readiness | proxy | Accepts, writes `🚀 ready to forward packets like a pro!` when the pool is non-empty, `⚠️ not ready! waiting for agents to join...` when it is empty, closes. Plain TCP, no status code |
++| `:4260` readiness | proxy | Reads the HTTP request head for up to 2 s (a client that sends nothing is tolerated), then answers `HTTP/1.1 200 OK` with body `ready` when the pool is non-empty, or `HTTP/1.1 503 Service Unavailable` with body `not ready` when it is empty. `Content-Type: text/plain; charset=utf-8`, `Content-Length`, `Connection: close` |
+ | `localhost:4000` health | agent | Accepts, writes `💅 slaying and thriving, PERIOD.`, closes. Bound to localhost only |
+ 
+-Because `:3130` and `:4260` both answer a bare TCP connect, a TCP probe succeeds on both even
+-when the pool is empty; only a probe that reads the body can distinguish the two readiness states.
++Readiness carries a real status code, so an `httpGet` probe sees `503` on an empty pool. The old
++`tcpSocket` probe keeps passing: the TCP connect still succeeds, and the handler simply spends its
++2 s request-read window before answering.
+ 
+ ## Observability
+ 
+-- Both processes call `logging.basicConfig(level=..., format="%(message)s")`. Lines carry neither
+-  a timestamp nor a level name; severity exists only as the level filter (`LOG_LEVEL`).
++- Both processes call `logging.basicConfig(level=..., format="%(asctime)s %(levelname)s %(message)s")`
++  and set `logging.Formatter.converter = time.gmtime`, so every line starts with a UTC timestamp
++  and its level name. Severity is visible in the line, not only in the `LOG_LEVEL` filter.
+ - Log lines are key/value pairs designed for `grep` and log search. The recurring keys are
+-  `agent=<uuid>`, `client=<ip:port>`, `state=`, `pool_size=`, `remaining_pool=`, `direction=`,
+-  `duration=`, `bytes_client_to_agent=`, `bytes_agent_to_client=`, `bytes_proxy_to_service=`,
+-  `bytes_service_to_proxy=`, `reason=`.
+-- Registration logs `state=registered peer=...`; assignment logs `state=assigned remaining_pool=N`;
+-  the discard paths log `state=zombie_detected` / `state=zombie_discarded`. `pool_size` appears only
+-  at DEBUG on registration, so an INFO log does not state the pool size on every change.
+-- There are no metrics and no traces. The probes are the only machine-readable signal.
++  `agent=<uuid>`, `agent_token=`, `client=`, `client_peer=`, `agent_peer=`, `state=`, `pool_size=`,
++  `remaining_pool=`, `direction=`, `duration=`, `bytes_client_to_agent=`,
++  `bytes_agent_to_client=`, `bytes_proxy_to_service=`, `bytes_service_to_proxy=`, `idle_seconds=`,
++  `service=`, `exception=`, `reason=`.
++- Pool size is logged at INFO on registration, assignment and discard:
++  `agent=<token> pool_size=N` after registration, `state=assigned remaining_pool=N` after
++  assignment, `state=zombie_discarded pool_size=N` when a dead entry is discarded.
++  `Context.report_pool()` adds a `pool_size=N` line every `POOL_REPORT_INTERVAL_SECONDS` (60 s by
++  default; `0` disables the periodic line, not the change lines). The sweep logs
++  `state=zombie_detected` and `cleaned_zombie_agents=N pool_size=N`.
++- Reconnect and handshake failures have their own lines: `state=control_timeout
++  idle_seconds=...` and `state=closed_by_proxy` on the agent, `service_connection_failed ...
++  exception=...` on a failed service dial, `handshake_failed reason=short_token bytes=N` or
++  `reason=handshake_error` on an agent handshake, and `bridge_aborted ... reason=` with
++  `agent_not_ready_timeout`, `agent_not_ready_closed` or `agent_not_ready` when the wait for
++  `ready` ends. `keepalive_not_tuned` exists only at DEBUG.
++- There are no metrics and no traces. The probes are the only machine-readable signal; readiness
++  is the alerting hook for an empty pool.
+ 
+ ## Security boundaries
+ 
+@@ -243,7 +306,8 @@ when the pool is empty; only a probe that reads the body can distinguish the two
+ - TLS is optional and applies to the agent and client listeners together, using one server
+   certificate and key (`SSL_CERT`, `SSL_KEY`); the agent verifies the proxy against `SSL_CERT` when
+   `USE_SSL` is set. No client certificates, so the agent port stays open to any admitted peer.
+-- Liveness and readiness are plain, unencrypted ports.
++- Liveness is a plain TCP greeting; readiness is plain HTTP and exposes only a boolean
++  (`200`/`503`). Neither is encrypted or authenticated.
+ - The proxy forwards bytes without inspection: database authentication happens end to end between
+   client and service and DBridge never sees a credential it can interpret.
+ 
+diff --git a/docs/commands.md b/docs/commands.md
+index 3f8ce09..5ade02c 100644
+--- a/docs/commands.md
++++ b/docs/commands.md
+@@ -17,10 +17,7 @@ How to run the two processes in this repository — the proxy (`proxy.py`) and t
+ repository root unless stated otherwise; the toolchain is Python 3.14 asyncio, with no
+ third-party dependency.
+ 
+-Rows marked **new** or **changed** belong to the change in progress
+-(`.sdlc/issues/2026-10-28-agent-does-not-recover-after-the-proxy-is-replaced/02-design/iterations/001/spec.md`)
+-and describe the behaviour after it is deployed. Everything unmarked was verified against
+-`6f1fec7`. Flags and environment variables are listed in full in
++Flags and environment variables are listed in full in
+ [configuration.md](configuration.md).
+ 
+ ## CLI & scripts
+@@ -35,7 +32,7 @@ and describe the behaviour after it is deployed. Everything unmarked was verifie
+ | `docker build -f Dockerfile.agent -t dbridge-agent .` | Build the agent image (`python:3.14-alpine`, `CMD python agent.py`) | `docker build -f Dockerfile.agent -t dbridge-agent .` |
+ | `docker compose up -d` | Start the four dev databases defined in `docker-compose.yml` | `docker compose up -d mysql` |
+ | `docker compose down` | Stop them; `-v` also deletes their volumes | `docker compose down -v` |
+-| `python -m unittest -v` | Discover and run `test*.py` from the repository root | `python -m unittest -v` |
++| `python -m unittest discover -v` | Discover and run `test*.py` from the repository root | `python -m unittest discover -v` |
+ | `python -m unittest -v test_proxy` | Run a single test module | `python -m unittest -v test_proxy` |
+ | `pyinstaller dbridge_agent.spec` | Build the one-file `dbridge_agent` Windows executable from the committed spec | `pyinstaller dbridge_agent.spec` |
+ 
+@@ -52,7 +49,7 @@ not handled and kills the process without running that path.
+ | Port | Flag / variable | Purpose |
+ |---|---|---|
+ | 3130 | `-l/--port-liveness`, `PORT_LIVENESS` | Plain-TCP liveness probe |
+-| 4260 | `-r/--port-readiness`, `PORT_READINESS` | Readiness probe — plain text today, **changed** to HTTP `200`/`503` by the change in progress |
++| 4260 | `-r/--port-readiness`, `PORT_READINESS` | Readiness probe — HTTP `200` with body `ready` / `503` with body `not ready` |
+ | 7000 | `-a/--port-agents`, `PORT_AGENTS` | Agent control connections (raw TCP, 16-byte token handshake) |
+ | 9000 | `-p/--port-clients`, `PORT_CLIENTS` | Client data connections (raw TCP) |
+ 
+@@ -63,15 +60,17 @@ A typical development run that keeps the proxy off the default ports and admits
+ $ python proxy.py -x 127.0.0.1 -a 17000 -p 19000 -l 13130 -r 14260 -q 127.0.0.1 -i 127.0.0.1
+ ```
+ 
+-Logging is `logging.basicConfig` at `--log-level` (default `INFO`). **Changed**: each line is
++Logging is `logging.basicConfig` at `--log-level` (default `INFO`). Each line is
+ prefixed with a UTC timestamp and the level, format `%(asctime)s %(levelname)s %(message)s`
+-with `time.gmtime`, and the pool reports `pool_size=N` on change and every
+-`POOL_REPORT_INTERVAL_SECONDS`:
++with `time.gmtime`, and the pool reports its size on registration, assignment and discard,
++plus a periodic `pool_size=N` line every `POOL_REPORT_INTERVAL_SECONDS` (`0` disables the
++periodic line):
+ 
+ ```text
+ 2026-10-28 10:34:57,120 INFO proxy_started host=0.0.0.0 agents_port=7000 clients_port=9000
+-2026-10-28 10:35:12,004 INFO agent=6f1fec73-... state=registered peer=10.0.0.7:51234
+-2026-10-28 10:35:12,004 INFO pool_size=1
++2026-10-28 10:35:12,004 INFO agent=3f9c2a7e-... state=registered peer=10.0.0.7:51234
++2026-10-28 10:35:12,005 INFO agent=3f9c2a7e-... pool_size=1
++2026-10-28 10:36:12,004 INFO pool_size=1
+ ```
+ 
+ The container image runs the same command; its `Dockerfile.proxy` exports the default
+@@ -158,22 +157,26 @@ $ nc -w 2 127.0.0.1 3130
+ 🚀 alive and forwarding packets like a champ!
+ ```
+ 
+-### Readiness — `:4260`, HTTP (**changed**)
++### Readiness — `:4260`, HTTP
+ 
+-Currently the port answers in plain text with no status line and no HTTP headers. After the
+-change it is a minimal HTTP/1.1 endpoint: `200 OK` with body `ready` when the pool holds at
+-least one agent, `503 Service Unavailable` with body `not ready` when it is empty.
++The port answers a minimal HTTP/1.1 request: `200 OK` with body `ready` when the pool holds at
++least one agent, `503 Service Unavailable` with body `not ready` when it is empty. It consumes
++the request up to `\r\n\r\n` (bounded at 2 s), so both `curl` and a bare TCP connect get an
++answer; the response carries `Content-Type: text/plain; charset=utf-8`,
++`Content-Length` and `Connection: close`.
+ 
+ ```bash
+ $ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:4260/
+ 200
++$ curl -s http://127.0.0.1:4260/
++ready
+ ```
+ 
+-An empty pool is a `503`, which removes the tenant from the Service endpoints — that is the
+-intended signal (see [architecture.md](architecture.md)). The Kubernetes readiness probe becomes
+-`httpGet` on port 4260; the chart lives in `setwin-bs/helm-charts`
+-(`charts/dbridge/templates/deployment.yaml`) and is configured through `setwin-bs/argocd-apps`,
+-so the manifest change ships from there, not from this repository.
++An empty pool is a `503` with body `not ready`, which removes the tenant from the Service
++endpoints — that is the intended signal (see [architecture.md](architecture.md)). The
++Kubernetes readiness probe must be `httpGet` on port 4260; the chart lives in
++`setwin-bs/helm-charts` (`charts/dbridge/templates/deployment.yaml`) and is configured through
++`setwin-bs/argocd-apps`, so the manifest change ships from there, not from this repository.
+ 
+ ### Agent health — `:4000`, plain TCP, loopback only
+ 
+@@ -185,35 +188,36 @@ $ nc -w 2 127.0.0.1 4000
+ ## Tests
+ 
+ The suite is `unittest`-based and needs no dependency beyond the standard library. It runs on
+-Python 3.14 (`python:3.14-alpine` in both images; `test_proxy.py` uses `IsolatedAsyncioTestCase`).
++Python 3.14 (`python:3.14-alpine` in both images; both test modules use
++`IsolatedAsyncioTestCase`). `test_proxy.py` covers pool lifecycle, readiness `200`/`503`, the
++stale-`pong` skip, the `ready` timeout and the short handshake; `test_agent.py` covers the
++control-frame deadline and fragmentation, reconnect, close-before-replacement ordering, the
++jittered retry delay on timeout and EOF, bounded connection growth under repeated failures,
++keepalive on a real `StreamWriter`, and the `FORWARD_IDLE_TIMEOUT_SECONDS=0` data path.
+ 
+ ```bash
+-$ python -m unittest -v
+-test_pop_agent_empty_pool_returns_none (test_proxy.AgentPoolLifecycleTest...) ... ok
+-test_pop_agent_returns_healthy_registered_agent (test_proxy.AgentPoolLifecycleTest...) ... ok
+-test_pop_agent_survives_agent_reset (test_proxy.AgentPoolLifecycleTest...) ... ok
+-
++$ python -m unittest discover -v | tail -4
+ ----------------------------------------------------------------------
+-Ran 3 tests in 0.199s
++Ran 22 tests in 5.429s
+ 
+ OK
+ ```
+ 
+-The reset test prints one `WARNING:root:agent=... ping_loop_failed closing_connection` line
+-between its name and `ok`; it is the expected path, not a failure.
++The run is verbose and prints expected `WARNING`/`ERROR` lines from the failure-path tests
++(e.g. `agent=... ping_loop_failed closing_connection`, `state=control_timeout`,
++`bridge_aborted ... reason=agent_not_ready_timeout`); they are the expected paths, not
++failures.
+ 
+-**New**: `test_agent.py` joins the suite with this change (control-read deadline, reconnect,
+-`FORWARD_IDLE_TIMEOUT_SECONDS=0`, service-connection failure), and
+-`.github/workflows/build-publish-proxy.yml` gains a `test` job that runs
+-`python -m unittest -v` on Python 3.14 before the image build. The agent and PyInstaller
+-workflows have no test job; only the proxy workflow does.
++`build-publish-proxy.yml` runs the same command in its `test` job on every push and pull
++request, and the image `build` job depends on it (`needs: test`). The agent and PyInstaller
++workflows still have no test job.
+ 
+ ## Conventions
+ 
+-- **No HTTP API.** The client (`:9000`) and agent (`:7000`) ports are raw TCP with a private
+-  handshake — 16 bytes of token, then `ping`/`pong`/`connect`/`ready`. The only HTTP surface is
+-  the readiness port (**changed**), documented above; there is nothing to authenticate or send a
+-  JSON body to. See [architecture.md](architecture.md) for the protocol.
++- **No HTTP API beyond readiness.** The client (`:9000`) and agent (`:7000`) ports are raw TCP
++  with a private handshake — 16 bytes of token, then `ping`/`pong`/`connect`/`ready`. The only
++  HTTP surface is the readiness port, documented above; there is nothing to authenticate or
++  send a JSON body to. See [architecture.md](architecture.md) for the protocol.
+ - **Signals and exit codes:** `0` after `SIGINT` (the `KeyboardInterrupt` handler closes the
+   servers and pool); `2` for an `argparse` usage error — unknown flag,
+   missing required `-x`/`-b` on the agent, or a value rejected by a validator; `1` for an
+diff --git a/docs/concepts.md b/docs/concepts.md
+index 960d958..6d3ad28 100644
+--- a/docs/concepts.md
++++ b/docs/concepts.md
+@@ -13,31 +13,34 @@ screenshots: false
+ 
+ 
+ The domain language of DBridge, one row per term. The third column points at the identifiers
+-that implement the term, so a reader can move from the word to the code. Definitions describe
+-what the code does at `6f1fec7`; the flows that use these terms are in
+-[architecture.md](architecture.md).
++that implement the term, so a reader can move from the word to the code. Definitions describe the
++implemented code; the flows that use these terms are in [architecture.md](architecture.md).
+ 
+ ## Glossary
+ 
+ | Term | Definition | Where it lives |
+ |---|---|---|
+-| **agent** | The process on a tenant host that dials out to the proxy and bridges assigned connections to a local service. One agent process holds several control connections; the connection, not the process, is what the proxy pools. | `agent.py`; one `run_agent` task per control connection, created by `spawn_agents` |
+-| **agent pool** | The proxy's in-memory set of registered agent connections available for assignment, in arrival order. It is never persisted and is empty after a proxy restart until agents register again. | `proxy.Context.agents`, a `list[Agent]` guarded by `Context.lock`; `Context.length()` |
++| **agent** | The process on a tenant host that dials out to the proxy and bridges assigned connections to a local service. One agent process holds several control connections; the connection, not the process, is what the proxy pools. An agent gives up on a control connection after `CONTROL_IDLE_TIMEOUT_SECONDS` of silence. | `agent.py`; one `run_agent` task per control connection, created by `spawn_agents` |
++| **agent pool** | The proxy's in-memory set of registered agent connections available for assignment, in arrival order. It is never persisted and is empty after a proxy restart until agents register again. Its size is logged on registration, assignment and discard, and periodically. | `proxy.Context.agents`, a `list[Agent]` guarded by `Context.lock`; `Context.length()`, `Context.report_pool()` |
+ | **assignment** | Taking one connection out of the pool for one client: the oldest entry is removed, its keepalive task is stopped, and the proxy sends `connect`. The connection is not returned to the pool afterwards. | `Context.pop_agent()`, `handle_client`; log `state=assigned remaining_pool=N` |
+-| **bridge** | One client connection carried end to end through the proxy and the agent to the tenant service. Each process runs two one-way copy loops for it; when one direction ends it closes its destination and the other unwinds. | `handle_client` (proxy), the `forward()` gather in `run_agent`; log `bridge_started` / `bridge_finished`, `bridge=preparing` / `bridge=finished` |
++| **bridge** | One client connection carried end to end through the proxy and the agent to the tenant service. Each process runs two one-way copy loops for it; when one direction ends it closes its destination and the other unwinds. There is no idle cutoff unless `FORWARD_IDLE_TIMEOUT_SECONDS` is set above 0. | `handle_client` (proxy), the `forward()` gather in `run_agent`; log `bridge_started` / `bridge_finished`, `bridge=preparing` / `bridge=finished` |
+ | **client** | Any TCP peer of the proxy's client port that speaks the database protocol; n8n in production. The proxy never parses what it sends. | `:9000` (`PORT_CLIENTS`), `handle_client` |
+-| **control connection** | The persistent outbound TCP connection an agent opens to the proxy's agents port, identified by its token, kept alive by `ping`/`pong` while idle, and promoted to the data path when the proxy sends `connect`. The same socket plays both roles. | `handle_agent` and `Context.add_agent` (proxy), `asyncio.open_connection` in `run_agent` (agent) |
++| **control connection** | The persistent outbound TCP connection an agent opens to the proxy's agents port, identified by its token, kept alive by `ping`/`pong` while idle, and promoted to the data path when the proxy sends `connect`. The same socket plays both roles. While idle it has a read deadline, so a proxy that vanishes without closing the socket is still detected. | `handle_agent` and `Context.add_agent` (proxy), `asyncio.open_connection` and `read_control_frame` in `run_agent` (agent) |
++| **control timeout** | The agent-side deadline on the wait for the proxy's next control frame: `ping` or `connect`. When it expires the agent logs `state=control_timeout`, closes the control socket with a bounded wait and queues one replacement, which registers against whatever proxy is running. Default 45 s, two missed 21 s pings plus margin. | `read_control_frame()`, `CONTROL_IDLE_TIMEOUT_SECONDS` / `--control-idle-timeout` in `run_agent` |
+ | **data stream** | The raw bytes a bridge carries after the handshake, in each direction: `client->agent` and `agent->client` on the proxy, `proxy->service` and `service->proxy` on the agent. It follows TCP, not SQL statement boundaries. | `proxy.forward()` and `agent.forward()`, called with a `direction` label |
+-| **forward loop** | The copy routine used in both processes: read up to 4096 bytes, write, drain, repeat until EOF or an error, then close the destination. Its optional idle cutoff is the only data-path timer. | `forward()` in `proxy.py` and `agent.py` |
+-| **keepalive (ping/pong)** | The proxy-driven liveness check on an idle control connection: `ping` every `PING_PONG_INTERVAL_SECONDS`, `pong` expected within 5 s. It runs only while the connection is in the pool. | `Agent.run_ping_pong()`; started by `add_agent`, stopped by `pop_agent` |
++| **forward loop** | The copy routine used in both processes: read up to 4096 bytes, write, drain, repeat until EOF or an error, then close the destination. Its optional idle cutoff is the only data-path timer, and it is off by default (`FORWARD_IDLE_TIMEOUT_SECONDS=0`). | `forward()` in `proxy.py` and `agent.py` |
++| **keepalive (ping/pong)** | The proxy-driven liveness check on an idle control connection: `ping` immediately after registration and then every `PING_PONG_INTERVAL_SECONDS`, `pong` expected within 5 s. It runs only while the connection is in the pool. A `pong` already in flight when the keepalive stops can still be buffered; the proxy skips it while waiting for `ready`. | `Agent.run_ping_pong()`, `await_ready()`; started by `add_agent`, stopped by `pop_agent` |
+ | **liveness probe** | The signal that the proxy process is up. It answers a connect on its port with a fixed greeting and says nothing about the pool. | `:3130` (`PORT_LIVENESS`), `handle_liveness` |
++| **OS keepalive** | Kernel-level `SO_KEEPALIVE` on the agent's control socket, tuned where the platform allows it (Linux `TCP_KEEPIDLE` 30 s, `TCP_KEEPINTVL` 10 s, `TCP_KEEPCNT` 3; Windows `SIO_KEEPALIVE_VALS` idle 30 s, interval 10 s). Best effort: a failed tuning is logged at DEBUG and never blocks the connection. A backstop, not the guarantee — the control timeout is. | `enable_keepalive()` in `agent.py` |
++| **pool size** | The number of agent connections currently registered in the pool. It is logged at INFO on registration, assignment and discard, and periodically every `POOL_REPORT_INTERVAL_SECONDS` (60 s by default; `0` disables only the periodic line). | `Context.length()`, `Context.report_pool()`; logs `pool_size=N`, `remaining_pool=N` |
+ | **proxy** | The process clients reach. It owns the pool, assigns agents and forwards bytes; one proxy deployment serves one tenant. | `proxy.py`, `Context` singleton |
+-| **readiness probe** | The signal that the proxy has at least one agent to assign. Today it writes one of two plain-text sentences and closes; it is not an HTTP endpoint and returns no status code. | `:4260` (`PORT_READINESS`), `handle_readiness` |
+-| **ready** | The five-byte message an agent sends after it has connected to the local service, telling the proxy it may start the bridge. The proxy waits for it before any client byte is forwarded. | `run_agent` (agent), `handle_client` (proxy) |
+-| **registration** | The proxy's acceptance of a new control connection: read 16 bytes as a UUID, create the agent entry, start its keepalive, append it to the pool. It is not authenticated and no token is checked against a known value. | `Context.add_agent()`; log `state=registered peer=...` |
+-| **service** | The tenant's database endpoint that the agent dials when assigned. The agent, not the proxy, opens this connection; the proxy never learns its address. | `SERVICE_HOST` / `SERVICE_PORT`, `asyncio.open_connection` in `run_agent` |
++| **readiness probe** | The signal that the proxy has at least one agent to assign. It is an HTTP/1.1 endpoint: `200 OK` with body `ready` when the pool is non-empty, `503 Service Unavailable` with body `not ready` when it is empty. It reads the request head for up to 2 s and also answers a bare TCP connect. | `:4260` (`PORT_READINESS`), `handle_readiness` |
++| **ready** | The five-byte message an agent sends after it has connected to the local service, telling the proxy it may start the bridge. The proxy waits for it for at most `READY_TIMEOUT_SECONDS` (30 s) after `connect`, skipping a stale `pong`, before any client byte is forwarded. | `run_agent` (agent), `handle_client` and `await_ready` (proxy) |
++| **registration** | The proxy's acceptance of a new control connection: read exactly 16 bytes within a 10 s bound as a UUID, create the agent entry, start its keepalive, append it to the pool. A short handshake is logged as `handshake_failed reason=short_token bytes=N`; a stalled or reset one as `reason=handshake_error`. Both are closed. It is not authenticated and no token is checked against a known value. | `Context.add_agent()`; log `state=registered peer=...` then `pool_size=N` |
++| **replacement connection** | The fresh `run_agent` task an agent queues after a control connection ends or is promoted to a bridge. `queue_replacement()` sets a flag, so exactly one replacement is queued per lost connection and `spawn_agents` starts it with a new token. Before the bridge, `finally` closes the failed socket, waits `RETRY_DELAY_SECONDS` plus 0–0.5 s of jitter, then queues the successor; a service-dial failure has no extra delay because its replacement was queued at `connect`. | `queue_replacement()` and `replacement_queued` in `run_agent`, `spawn_agents`, `reconnect_delay()` |
++| **service** | The tenant's database endpoint that the agent dials when assigned. The agent, not the proxy, opens this connection; the proxy never learns its address. A failed dial is logged as `service_connection_failed` with the real exception and the control connection is closed without `ready`. | `SERVICE_HOST` / `SERVICE_PORT`, `asyncio.open_connection` in `run_agent` |
+ | **tenant** | One customer environment whose database access goes through its own proxy deployment and the agents on its hosts, for example `jle-beeshop` or `seteras-beeshop`. Not a code identifier: isolation is per deployment, and log lines identify the actor by agent token, not by tenant name. | No identifier in `agent.py` or `proxy.py` |
+-| **token** | The 16 raw bytes of a `uuid.UUID` an agent writes first on a control connection; the proxy reads 16 bytes and uses the value to label the connection in every log line. It identifies a connection, not a credential, and changes on every reconnect. | Written by `run_agent` (`token.bytes`); read by `Context.add_agent` (`uuid.UUID(bytes=...)`) |
++| **token** | The 16 raw bytes of a `uuid.UUID` an agent writes first on a control connection; the proxy reads exactly 16 bytes and uses the value to label the connection in every log line. It identifies a connection, not a credential, and changes on every reconnect. | Written by `run_agent` (`token.bytes`); read by `Context.add_agent` (`readexactly(16)`, then `uuid.UUID(bytes=...)`) |
+ | **zombie** | A pool entry whose socket is already dead: the reader is at EOF or the writer is closing. Assignment skips and discards them; a background sweep can remove them earlier. | `Context.pop_agent()`; `Context.clean_zombies()` with `ZOMBIES_CLEAN_INTERVAL` |
+ 
+ ## Usage notes
+@@ -46,16 +49,24 @@ what the code does at `6f1fec7`; the flows that use these terms are in
+   them for its whole lifetime. One agent connection therefore serves at most one client, and a
+   long bridge reduces the idle count until a replacement connection registers.
+ - **control connection vs data stream.** They are the same socket. Before assignment it carries
+-  `ping`/`pong`; after `connect` and `ready` the same bytes become the raw data stream. A change to
+-  one phase affects the other.
++  `ping`/`pong` under the control deadline; after `connect` and `ready` the same bytes become the
++  raw data stream, and only `FORWARD_IDLE_TIMEOUT_SECONDS` governs the data path (off by default).
++  A change to one phase affects the other.
++- **A lost connection vs an idle one.** At the application level both look like silence. The
++  control timeout is what turns silence into a decision, so reconnection does not depend on the
++  peer closing the socket or on a FIN/RST arriving. The OS keepalive is only a backstop.
++- **Replacement, not retry.** The agent keeps its capacity with a fresh `run_agent` task queued by
++  the connection that ends; it does not retry on the same socket. Exactly one replacement is
++  queued per lost connection, and only after the failed socket is closed and the jittered delay
++  has elapsed, so a failed handshake cannot multiply connections.
+ - **tenant vs proxy.** One tenant maps to one proxy deployment and its own pool; tenants are not
+   multiplexed inside a single pool. Nothing in the code carries a tenant field, so a log line is
+   attributed to a tenant through the deployment it came from plus the agent token.
+ - **token is not a secret.** It is not verified, not shared in advance and not reused: it is a
+   per-connection label. Do not use "credential" or "session token" for it.
+-- **readiness vs liveness.** Liveness answers "the process is up"; readiness answers "there is an
+-  agent to serve a client". Today both ports answer any TCP connect, so only reading the readiness
+-  body distinguishes an empty pool.
++- **readiness vs liveness.** Liveness answers "the process is up" with a TCP greeting; readiness
++  answers "there is an agent to serve a client" with an HTTP status. A bare TCP probe still
++  connects to `:4260` and passes; only an HTTP `GET` observes the `503`.
+ - **"thread" is a legacy name.** `MIN_THREADS` / `--min-threads` is the number of initial agent
+   tasks, not OS threads. The implementation is asyncio throughout; prefer "agent connections" when
+   describing it.
+diff --git a/docs/configuration.md b/docs/configuration.md
+index 99b77ac..d420082 100644
+--- a/docs/configuration.md
++++ b/docs/configuration.md
+@@ -23,10 +23,6 @@ precedence is always:
+ 2. **environment variable** of the same name,
+ 3. **built-in default** — or the `ENV` baked into the image, which is the same mechanism.
+ 
+-Rows marked **new** or **changed** belong to the change in progress
+-(`.sdlc/issues/2026-10-28-agent-does-not-recover-after-the-proxy-is-replaced/02-design/iterations/001/spec.md`)
+-and take effect when it is deployed; everything unmarked was verified against `6f1fec7`.
+-
+ One behaviour to know before relying on a variable: validators run on **flags only**. A numeric
+ variable that cannot be parsed silently falls back to the built-in default, and a value that
+ parses but is out of range is accepted as-is (e.g. `MIN_THREADS=0` starts no control
+@@ -41,7 +37,7 @@ therefore produces defaults, not an error; the same bad value on the command lin
+ |---|---|---|---|---|
+ | `HOST` | `-x`, `--host` | `0.0.0.0` | any bind address | Address all four listeners bind to. |
+ | `PORT_LIVENESS` | `-l`, `--port-liveness` | `3130` | integer | Plain-TCP liveness probe port. |
+-| `PORT_READINESS` | `-r`, `--port-readiness` | `4260` | integer | Readiness port; **changed** to HTTP `200`/`503`. |
++| `PORT_READINESS` | `-r`, `--port-readiness` | `4260` | integer | Readiness port; HTTP `200` with `ready` / `503` with `not ready`. |
+ | `PORT_AGENTS` | `-a`, `--port-agents` | `7000` | integer | Agent control connections. |
+ | `PORT_CLIENTS` | `-p`, `--port-clients` | `9000` | integer | Client data connections. |
+ | `ALLOWED_AGENTS` | `-q`, `--allow-agent` | `*` | `*`, or a list of hostnames/IPs | Peers allowed on the agents port. The environment value is a single string matched with `in`; use the flag (space-separated, `nargs='+'`) for more than one host. |
+@@ -50,10 +46,10 @@ therefore produces defaults, not an error; the same bad value on the command lin
+ | `WAIT_AGENT_RETRY_INTERVAL` | `-j`, `--wait-agent-retry-interval` | `0.7` | `> 0` and `<= 300` seconds | Sleep between those attempts. |
+ | `ZOMBIES_CLEAN_INTERVAL` | `-z`, `--zombies-clean-interval` | `0` in code; `90` in `Dockerfile.proxy` | `>= 0` and `<= 300` seconds; the flag also accepts the word `off` (= `0`) | Background sweep that drops agents whose socket is at EOF. `0` disables the sweep; zombies are then only discarded when a client is assigned an agent. |
+ | `PING_PONG_INTERVAL_SECONDS` | `-u`, `--ping-pong-interval` | `21` | `> 0` and `< 30` seconds | Ping cadence per pooled agent; the agent answers `pong` within 5 s. |
+-| `FORWARD_IDLE_TIMEOUT_SECONDS` | `-f`, `--forward-idle-timeout` | **changed**: `0` (was `300.0`) | `>= 0` seconds | Idle cutoff on a client↔service data stream. `0` disables it. |
+-| `READY_TIMEOUT_SECONDS` | — (**new**, no flag) | **new**: `30` | seconds; the design specifies no validator | How long the proxy waits for an agent's `ready` after `connect`. On expiry the bridge is closed with `reason=agent_not_ready_timeout` and the client is released; the pool is not shrunk. |
+-| `POOL_REPORT_INTERVAL_SECONDS` | — (**new**, no flag) | **new**: `60` | `0` disables | Periodic `pool_size=N` INFO line, in addition to the log on every registration, assignment and discard. |
+-| `LOG_LEVEL` | `-v`, `--log-level` | `INFO` | any name in `logging.getLevelNamesMapping()`, case-insensitive (`DEBUG`, `WARNING`, …) | Log verbosity. **Changed**: lines gain a UTC timestamp and level. |
++| `FORWARD_IDLE_TIMEOUT_SECONDS` | `-f`, `--forward-idle-timeout` | `0` | `>= 0` seconds | Idle cutoff on a client↔service data stream. `0` disables it. |
++| `READY_TIMEOUT_SECONDS` | `--ready-timeout` | `30` | `> 0` and `<= 300` seconds | How long the proxy waits for an agent's `ready` after `connect`, skipping a stale `pong`. On expiry it logs `bridge_aborted reason=agent_not_ready_timeout`, closes both sides and leaves the rest of the pool untouched; the popped agent has already left the pool and is not re-queued. |
++| `POOL_REPORT_INTERVAL_SECONDS` | `--pool-report-interval` | `60` | `>= 0` and `<= 300` seconds; `0` disables | Periodic `pool_size=N` INFO line, in addition to the log on every registration, assignment and discard. |
++| `LOG_LEVEL` | `-v`, `--log-level` | `INFO` | any name in `logging.getLevelNamesMapping()`, case-insensitive (`DEBUG`, `WARNING`, …) | Log verbosity; lines carry a UTC timestamp and level. |
+ | `USE_SSL` | `-s`, `--ssl` | `no` (`false`) | boolean strings, e.g. `yes`/`y`/`true`/`on`/`1` and `no`/`n`/`false`/`off`/`0` (see `parse_bool`) | TLS on the **agents and clients** ports only; liveness and readiness stay plain. |
+ | `SSL_CERT` | `-c`, `--cert` | unset | path to a PEM certificate | Required when `USE_SSL` is on (`load_cert_chain`). |
+ | `SSL_KEY` | `-k`, `--key` | unset | path to a PEM private key | Required when `USE_SSL` is on. |
+@@ -68,10 +64,10 @@ therefore produces defaults, not an error; the same bad value on the command lin
+ | `SERVICE_HOST` | `-d`, `--service-host` | `localhost` | hostname or IP | Local service to bridge to. |
+ | `SERVICE_PORT` | `-b`, `--service-port` | **required** — no default in code; `Dockerfile.agent` sets `3306` | integer | Local service port. Missing flag and variable → exit `2`. |
+ | `MIN_THREADS` | `-n`, `--min-threads` | `os.cpu_count()` (falls back to `1`); `Dockerfile.agent` sets `3` | integer `> 0` | Control connections opened at start. A replacement is queued whenever a connection ends or is handed to a bridge, so the agent keeps itself at that level. |
+-| `RETRY_DELAY_SECONDS` | `-r`, `--retry-delay-seconds` | `1.0` | `> 0` and `<= 300` seconds | Delay before reconnecting after a failure or a failed handshake. **New**: a small random jitter is added so a whole tenant's agents do not retry in lockstep. |
+-| `CONTROL_IDLE_TIMEOUT_SECONDS` | — (**new**, no flag) | **new**: `45` | `> 0` seconds | Deadline for the next proxy ping while the agent waits in the pool (`asyncio.wait_for` on the 7-byte control read). On expiry the agent logs `control_timeout`, closes the control socket and reconnects. Keep it above the proxy's `PING_PONG_INTERVAL_SECONDS`; 45 s is two missed 21 s pings plus margin. |
+-| `FORWARD_IDLE_TIMEOUT_SECONDS` | `-f`, `--forward-idle-timeout` | **changed**: `0` (was `15.0`) | `>= 0` seconds | Idle cutoff on a bridged data stream. `0` (the new default) never cuts a slow statement. |
+-| `LOG_LEVEL` | `-v`, `--log-level` | `INFO` | any name in `logging.getLevelNamesMapping()`, case-insensitive | Log verbosity. **Changed**: lines gain a UTC timestamp and level. |
++| `RETRY_DELAY_SECONDS` | `-r`, `--retry-delay-seconds` | `1.0` | `> 0` and `<= 300` seconds | Base delay before reconnecting after any pre-bridge failure (connect/TLS error, control timeout, EOF, reset, failed handshake). The failed socket is closed first, then the delay elapses, then one replacement is queued. A random jitter of up to 0.5 s is added so a whole tenant's agents do not retry in lockstep. |
++| `CONTROL_IDLE_TIMEOUT_SECONDS` | `--control-idle-timeout` | `45` | `> 0` and `<= 300` seconds | Deadline for one complete control frame from the proxy (`ping` or `connect`) while the agent waits in the pool. On expiry the agent logs `state=control_timeout`, closes the control socket and reconnects. Keep it above the proxy's `PING_PONG_INTERVAL_SECONDS`; 45 s is two missed 21 s pings plus margin. |
++| `FORWARD_IDLE_TIMEOUT_SECONDS` | `-f`, `--forward-idle-timeout` | `0` | `>= 0` seconds | Idle cutoff on a bridged data stream. `0` never cuts a slow statement. |
++| `LOG_LEVEL` | `-v`, `--log-level` | `INFO` | any name in `logging.getLevelNamesMapping()`, case-insensitive | Log verbosity; lines carry a UTC timestamp and level. |
+ | `USE_SSL` | `-s`, `--ssl` | `no` (`false`) | boolean strings, as on the proxy | TLS to the proxy. |
+ | `SSL_CERT` | `-c`, `--cert` | unset | path to a **CA** certificate (PEM) | Used as `create_default_context(cafile=...)`. Required when `USE_SSL` is on. The agent presents no client certificate. |
+ 
+@@ -96,6 +92,11 @@ running:
+ | `ZOMBIES_CLEAN_INTERVAL` (proxy) | `0` (no background sweep) | `90` seconds |
+ | `MIN_THREADS` (agent) | `os.cpu_count()` | `3` |
+ 
++Neither `Dockerfile` sets the variables added with the liveness work, so an image runs the
++code defaults: proxy `READY_TIMEOUT_SECONDS=30`, `POOL_REPORT_INTERVAL_SECONDS=60`,
++`FORWARD_IDLE_TIMEOUT_SECONDS=0`; agent `CONTROL_IDLE_TIMEOUT_SECONDS=45`,
++`FORWARD_IDLE_TIMEOUT_SECONDS=0`. Override them with `-e` or the flags.
++
+ ## Feature flags
+ 
+ There are no feature flags and no remote gating: every behaviour is fixed by the code and the
+@@ -104,8 +105,8 @@ not rollout flags.
+ 
+ | Setting | Default | `0` means | Owner |
+ |---|---|---|---|
+-| `FORWARD_IDLE_TIMEOUT_SECONDS` (proxy and agent) | `0` (**changed**) | no idle cut-off — a slow statement is never severed | platform operators |
+-| `POOL_REPORT_INTERVAL_SECONDS` (proxy, **new**) | `60` | no periodic `pool_size` line; changes are still logged | platform operators |
++| `FORWARD_IDLE_TIMEOUT_SECONDS` (proxy and agent) | `0` | no idle cut-off — a slow statement is never severed | platform operators |
++| `POOL_REPORT_INTERVAL_SECONDS` (proxy) | `60` | no periodic `pool_size` line; changes are still logged | platform operators |
+ | `ZOMBIES_CLEAN_INTERVAL` (proxy) | `0` in code, `90` in the image | no background sweep; zombies are discarded on assignment only | platform operators |
+ 
+ ## Secrets policy
+diff --git a/proxy.py b/proxy.py
+index 24c42af..1523a0e 100644
+--- a/proxy.py
++++ b/proxy.py
+@@ -25,6 +25,50 @@ def writer_peer(writer: asyncio.StreamWriter | None) -> tuple[str, int] | None:
+     return transport.get_extra_info('peername')
+ 
+ 
++def configure_logging(level: str) -> None:
++    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(message)s")
++    logging.Formatter.converter = time.gmtime  # timestamps in UTC
++
++
++async def close_writer(writer: asyncio.StreamWriter | None, timeout: float = 5.0) -> None:
++    """Close a writer without letting a dead peer wedge the caller."""
++    if writer is None:
++        return
++
++    writer.close()
++    try:
++        await asyncio.wait_for(writer.wait_closed(), timeout=timeout)
++    except (asyncio.TimeoutError, OSError):
++        pass
++
++
++async def await_ready(reader: asyncio.StreamReader, timeout: float) -> bytes:
++    """Wait for an agent's `ready`, discarding a stale keepalive `pong`."""
++    loop = asyncio.get_running_loop()
++    deadline = loop.time() + timeout
++
++    while True:
++        remaining = deadline - loop.time()
++        if remaining <= 0:
++            raise asyncio.TimeoutError
++
++        head = await asyncio.wait_for(reader.readexactly(4), timeout=remaining)
++
++        if head == b"pong":
++            continue
++
++        if head == b"read":
++            remaining = deadline - loop.time()
++            if remaining <= 0:
++                raise asyncio.TimeoutError
++            tail = await asyncio.wait_for(reader.readexactly(1), timeout=remaining)
++            if tail == b"y":
++                return b"ready"
++            return head + tail
++
++        return head
++
++
+ class Agent:
+     token: uuid.UUID
+ 
+@@ -106,8 +150,27 @@ class Context:
+             return len(self.agents)
+ 
+     async def add_agent(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, ping_pong_interval: float):
+-        token = uuid.UUID(bytes=await reader.read(16))
+         agent_peer = writer_peer(writer)
++
++        try:
++            token_bytes = await asyncio.wait_for(reader.readexactly(16), timeout=10)
++        except asyncio.IncompleteReadError as exc:
++            logging.warning(
++                "agent_peer=%s handshake_failed reason=short_token bytes=%d",
++                format_peer(agent_peer),
++                len(exc.partial),
++            )
++            await close_writer(writer)
++            return
++        except (asyncio.TimeoutError, ConnectionResetError, OSError):
++            logging.warning(
++                "agent_peer=%s handshake_failed reason=handshake_error",
++                format_peer(agent_peer),
++            )
++            await close_writer(writer)
++            return
++
++        token = uuid.UUID(bytes=token_bytes)
+         logging.info("agent=%s state=registered peer=%s", token, format_peer(agent_peer))
+ 
+         agent = Agent(token, reader, writer, ping_pong_interval)
+@@ -115,7 +178,9 @@ class Context:
+ 
+         async with self.lock:
+             self.agents.append(agent)
+-            logging.debug("agent=%s pool_size=%d", token, len(self.agents))
++            pool_size = len(self.agents)
++
++        logging.info("agent=%s pool_size=%d", token, pool_size)
+ 
+     async def clean_zombies(self, sleep_interval: float):
+         while True:
+@@ -134,16 +199,21 @@ class Context:
+                         async with self.lock:
+                             self.agents.remove(agent)  # 🗑 discarding!
+ 
+-                        agent.writer.close()
+-                        closing_zombies.append(agent.writer.wait_closed())
++                        closing_zombies.append(close_writer(agent.writer))
+ 
+                     except ValueError:  # agent already popped by another thread...
+                         logging.debug("agent=%s zombie_already_removed", agent.token)
+ 
+             await asyncio.gather(*closing_zombies, return_exceptions=True)
+ 
+-            if len(closing_zombies) > 0:
+-                logging.info("cleaned_zombie_agents=%d", len(closing_zombies))
++            if closing_zombies:
++                async with self.lock:
++                    pool_size = len(self.agents)
++                logging.info(
++                    "cleaned_zombie_agents=%d pool_size=%d",
++                    len(closing_zombies),
++                    pool_size,
++                )
+ 
+     async def pop_agent(self) -> Agent | None:
+         while True:
+@@ -157,14 +227,20 @@ class Context:
+             await agent.stop_ping_pong()
+ 
+             if agent.reader.at_eof() or agent.writer.is_closing():
+-                logging.info("agent=%s state=zombie_discarded", agent.token)
+-                agent.writer.close()
+-                await asyncio.gather(agent.writer.wait_closed(), return_exceptions=True)
++                logging.info("agent=%s state=zombie_discarded pool_size=%d", agent.token, pool_size)
++                await close_writer(agent.writer)
+                 continue
+ 
+             logging.info("agent=%s state=assigned remaining_pool=%d", agent.token, pool_size)
+             return agent
+ 
++    async def report_pool(self, interval: float):
++        while True:
++            await asyncio.sleep(interval)
++            async with self.lock:
++                pool_size = len(self.agents)
++            logging.info("pool_size=%d", pool_size)
++
+ 
+ context = Context()
+ 
+@@ -218,6 +294,26 @@ def validate_wait_agent_retry_interval(value):
+         raise argparse.ArgumentTypeError("Invalid float value.") from exc
+ 
+ 
++def validate_ready_timeout(value):
++    try:
++        f_value = float(value)
++        if f_value <= 0 or f_value > 300:
++            raise argparse.ArgumentTypeError("must be > 0 and <= 300")
++        return f_value
++    except ValueError as exc:
++        raise argparse.ArgumentTypeError("Invalid float value.") from exc
++
++
++def validate_pool_report_interval(value):
++    try:
++        f_value = float(value)
++        if f_value < 0 or f_value > 300:
++            raise argparse.ArgumentTypeError("must be >= 0 and <= 300")
++        return f_value
++    except ValueError as exc:
++        raise argparse.ArgumentTypeError("Invalid float value.") from exc
++
++
+ def validate_zombies_clean_interval(value):
+     if value == "off":
+         return 0
+@@ -306,7 +402,17 @@ def parse_args() -> argparse.Namespace:
+     default_forward_idle_timeout_seconds = parse(
+         to=float,
+         value=os.getenv("FORWARD_IDLE_TIMEOUT_SECONDS"),
+-        or_default=300.0,
++        or_default=0.0,
++    )
++    default_ready_timeout_seconds = parse(
++        to=float,
++        value=os.getenv("READY_TIMEOUT_SECONDS"),
++        or_default=30.0,
++    )
++    default_pool_report_interval_seconds = parse(
++        to=float,
++        value=os.getenv("POOL_REPORT_INTERVAL_SECONDS"),
++        or_default=60.0,
+     )
+ 
+     default_log_level = os.getenv("LOG_LEVEL", "INFO")
+@@ -422,6 +528,26 @@ def parse_args() -> argparse.Namespace:
+         ) % default_forward_idle_timeout_seconds,
+     )
+ 
++    parser.add_argument(
++        "--ready-timeout",
++        type=validate_ready_timeout,
++        default=default_ready_timeout_seconds,
++        help=(
++            "Seconds to wait for an agent to answer `ready` after `connect` before aborting "
++            f"the bridge (default: {default_ready_timeout_seconds:.0f}s)."
++        ),
++    )
++
++    parser.add_argument(
++        "--pool-report-interval",
++        type=validate_pool_report_interval,
++        default=default_pool_report_interval_seconds,
++        help=(
++            "Seconds between periodic `pool_size` log lines. Set to 0 to disable "
++            f"(default: {default_pool_report_interval_seconds:.0f}s)."
++        ),
++    )
++
+     parser.add_argument(
+         "-v", "--log-level",
+         type=validate_log_level,
+@@ -514,8 +640,7 @@ async def forward(
+         )
+ 
+     finally:
+-        destination.close()
+-        await destination.wait_closed()
++        await close_writer(destination)
+ 
+     return total_bytes
+ 
+@@ -524,21 +649,36 @@ async def handle_liveness(_reader: asyncio.StreamReader, writer: asyncio.StreamW
+     writer.write("🚀 alive and forwarding packets like a champ!".encode())
+     await writer.drain()
+ 
+-    writer.close()
+-    await writer.wait_closed()
++    await close_writer(writer)
+ 
+ 
+-async def handle_readiness(_reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+-    if await context.length() == 0:
+-        message = "⚠️ not ready! waiting for agents to join..."
+-    else:
+-        message = "🚀 ready to forward packets like a pro!"
++async def handle_readiness(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
++    # Consume the request (an httpGet probe sends one; a tcpSocket probe does not).
++    try:
++        await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=2)
++    except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, asyncio.TimeoutError, OSError):
++        pass
++
++    ready = await context.length() > 0
++    status = "200 OK" if ready else "503 Service Unavailable"
++    body = "ready" if ready else "not ready"
++
++    response = (
++        f"HTTP/1.1 {status}\r\n"
++        "Content-Type: text/plain; charset=utf-8\r\n"
++        f"Content-Length: {len(body)}\r\n"
++        "Connection: close\r\n"
++        "\r\n"
++        f"{body}"
++    )
+ 
+-    writer.write(message.encode("utf-8"))
+-    await writer.drain()
++    try:
++        writer.write(response.encode("utf-8"))
++        await writer.drain()
++    except OSError:
++        pass
+ 
+-    writer.close()
+-    await writer.wait_closed()
++    await close_writer(writer)
+ 
+ 
+ async def handle_agent(
+@@ -570,6 +710,7 @@ async def handle_client(
+     wait_agent_max_tries: int,
+     wait_agent_retry_interval: float,
+     forward_idle_timeout: float,
++    ready_timeout: float,
+ ):
+     client_peername = writer.transport.get_extra_info('peername')
+ 
+@@ -619,8 +760,7 @@ async def handle_client(
+         )
+ 
+     if not agent:
+-        writer.close()
+-        await writer.wait_closed()
++        await close_writer(writer)
+         return
+ 
+     agent.writer.write(b"connect")
+@@ -628,19 +768,26 @@ async def handle_client(
+ 
+     agent_peername = agent.writer.transport.get_extra_info('peername')
+ 
+-    if await agent.reader.read(5) != b"ready":
++    ready = None
++    reason = "agent_not_ready"
++    try:
++        ready = await await_ready(agent.reader, ready_timeout)
++    except asyncio.TimeoutError:
++        reason = "agent_not_ready_timeout"
++    except (asyncio.IncompleteReadError, OSError):
++        reason = "agent_not_ready_closed"
++
++    if ready != b"ready":
+         logging.error(
+-            "bridge_aborted agent_token=%s client_peer=%s reason=agent_not_ready",
++            "bridge_aborted agent_token=%s client_peer=%s reason=%s",
+             agent.token,
+             format_peer(client_peername),
++            reason,
+         )
+-        writer.close()
+-        agent.writer.close()
+ 
+         await asyncio.gather(
+-            writer.wait_closed(),
+-            agent.writer.wait_closed(),
+-            return_exceptions=True
++            close_writer(writer),
++            close_writer(agent.writer),
+         )
+ 
+         return
+@@ -694,13 +841,9 @@ async def handle_client(
+             format_peer(client_peername),
+         )
+ 
+-        agent.writer.close()
+-        writer.close()
+-
+         await asyncio.gather(
+-            agent.writer.wait_closed(),
+-            writer.wait_closed(),
+-            return_exceptions=True
++            close_writer(agent.writer),
++            close_writer(writer),
+         )
+ 
+ 
+@@ -715,8 +858,7 @@ async def shutdown(loop, servers: tuple):
+         agent = await context.pop_agent()
+ 
+         if agent:
+-            agent.writer.close()
+-            closing_sockets.append(agent.writer.wait_closed())
++            closing_sockets.append(close_writer(agent.writer))
+ 
+     for server in servers:
+         server.close()
+@@ -735,7 +877,7 @@ async def main():
+     args = parse_args()
+     loop = asyncio.get_running_loop()
+ 
+-    logging.basicConfig(level=args.log_level, format="%(message)s")
++    configure_logging(args.log_level)
+ 
+     ssl_context = None
+     if args.ssl:
+@@ -766,6 +908,7 @@ async def main():
+                 args.wait_agent_max_tries,
+                 args.wait_agent_retry_interval,
+                 args.forward_idle_timeout,
++                args.ready_timeout,
+             ),
+             args.host,
+             args.port_clients,
+@@ -776,6 +919,9 @@ async def main():
+     if args.zombies_clean_interval > 0:
+         asyncio.create_task(context.clean_zombies(args.zombies_clean_interval))
+ 
++    if args.pool_report_interval > 0:
++        asyncio.create_task(context.report_pool(args.pool_report_interval))
++
+     try:
+         logging.info(
+             "proxy_started host=%s agents_port=%d clients_port=%d",
+diff --git a/test_proxy.py b/test_proxy.py
+index bf8e5bb..5330909 100644
+--- a/test_proxy.py
++++ b/test_proxy.py
+@@ -11,6 +11,7 @@ killing the client handler.
+ import asyncio
+ import socket
+ import struct
++import time
+ import unittest
+ import uuid
+ 
+@@ -122,5 +123,147 @@ class AgentPoolLifecycleTest(unittest.IsolatedAsyncioTestCase):
+         await asyncio.gather(writer.wait_closed(), return_exceptions=True)
+ 
+ 
++class ProxyHandlerTest(unittest.IsolatedAsyncioTestCase):
++    """Readiness, handshake and `ready`-timeout behaviour of the proxy handlers."""
++
++    async def asyncSetUp(self):
++        self._original_context = proxy.context
++        self.context = proxy.Context()
++        proxy.context = self.context
++
++    async def asyncTearDown(self):
++        proxy.context = self._original_context
++
++    async def _serve(self, handler):
++        server = await asyncio.start_server(handler, "127.0.0.1", 0)
++        self.addAsyncCleanup(self._close_server, server)
++        return server.sockets[0].getsockname()[1]
++
++    async def _close_server(self, server):
++        server.close()
++        await server.wait_closed()
++
++    async def _close_writer(self, writer):
++        writer.close()
++        await asyncio.gather(writer.wait_closed(), return_exceptions=True)
++
++    async def _register_agent(self, ping_pong_interval=0.05):
++        token = uuid.uuid4()
++        registered = asyncio.Event()
++
++        async def fake_agent(reader, writer):
++            try:
++                writer.write(token.bytes)
++                await writer.drain()
++                registered.set()
++                while True:
++                    try:
++                        data = await reader.read(4)
++                    except ConnectionResetError:
++                        break
++                    if data != b"ping":
++                        break
++                    writer.write(b"pong")
++                    await writer.drain()
++            finally:
++                writer.close()
++
++        port = await self._serve(fake_agent)
++        reader, writer = await asyncio.open_connection("127.0.0.1", port)
++        self.addAsyncCleanup(self._close_writer, writer)
++        await self.context.add_agent(reader, writer, ping_pong_interval)
++        await asyncio.wait_for(registered.wait(), timeout=1)
++        return token
++
++    async def _get(self, port):
++        reader, writer = await asyncio.open_connection("127.0.0.1", port)
++        self.addAsyncCleanup(self._close_writer, writer)
++        writer.write(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
++        await writer.drain()
++        return await asyncio.wait_for(reader.read(), timeout=2)
++
++    async def test_readiness_returns_503_when_empty(self):
++        port = await self._serve(proxy.handle_readiness)
++
++        response = await self._get(port)
++
++        self.assertTrue(response.startswith(b"HTTP/1.1 503"), response)
++
++    async def test_readiness_returns_200_with_agent(self):
++        await self._register_agent()
++        port = await self._serve(proxy.handle_readiness)
++
++        response = await self._get(port)
++
++        self.assertTrue(response.startswith(b"HTTP/1.1 200"), response)
++        self.assertTrue(response.endswith(b"ready"), response)
++
++    async def test_ready_skips_stale_pong(self):
++        reader = asyncio.StreamReader()
++        reader.feed_data(b"pongready")
++
++        self.assertEqual(await proxy.await_ready(reader, 1), b"ready")
++
++    async def test_ready_timeout_closes_without_pool_loss(self):
++        token = uuid.uuid4()
++
++        async def never_ready(reader, writer):
++            try:
++                writer.write(token.bytes)
++                await writer.drain()
++                await reader.read(7)  # consume `connect` (or a ping)
++                await reader.read()  # never send `ready`; wait for the proxy to close
++            finally:
++                writer.close()
++
++        agent_port = await self._serve(never_ready)
++        agent_reader, agent_writer = await asyncio.open_connection("127.0.0.1", agent_port)
++        self.addAsyncCleanup(self._close_writer, agent_writer)
++        await self.context.add_agent(agent_reader, agent_writer, 0.05)
++
++        client_port = await self._serve(
++            lambda reader, writer: proxy.handle_client(
++                reader, writer, ["*"], 1, 0.01, 0, 0.2
++            )
++        )
++        client_reader, client_writer = await asyncio.open_connection("127.0.0.1", client_port)
++        self.addAsyncCleanup(self._close_writer, client_writer)
++
++        started = time.monotonic()
++        data = await asyncio.wait_for(client_reader.read(), timeout=3)
++        elapsed = time.monotonic() - started
++
++        self.assertEqual(data, b"")
++        self.assertLess(elapsed, 2.0)
++        self.assertEqual(await self.context.length(), 0)
++
++        # The handler didn't wedge the pool: a fresh agent can register again.
++        await self._register_agent()
++        self.assertEqual(await self.context.length(), 1)
++
++    async def test_short_handshake_is_closed(self):
++        port = await self._serve(lambda reader, writer: proxy.handle_agent(reader, writer, ["*"], 0.05))
++        reader, writer = await asyncio.open_connection("127.0.0.1", port)
++        self.addAsyncCleanup(self._close_writer, writer)
++
++        writer.write(b"abc")
++        await writer.drain()
++        writer.write_eof()
++
++        data = await asyncio.wait_for(reader.read(), timeout=2)
++        self.assertEqual(data, b"")
++
++    async def test_pool_report_logs_size(self):
++        task = asyncio.create_task(self.context.report_pool(0.05))
++        try:
++            with self.assertLogs(level="INFO") as captured:
++                await asyncio.sleep(0.2)
++        finally:
++            task.cancel()
++            await asyncio.gather(task, return_exceptions=True)
++
++        self.assertTrue(any("pool_size=0" in line for line in captured.output))
++
++
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/test_agent.py b/test_agent.py
+new file mode 100644
+index 0000000..40dbd79
+--- /dev/null
++++ b/test_agent.py
+@@ -0,0 +1,445 @@
++"""Tests for the agent's control-connection liveness and reconnect behaviour.
++
++These cover the incident where a proxy pod was replaced, the agent stayed blocked on a
++half-open socket and the tenant lost access until a human restarted the service.
++"""
++
++import asyncio
++import socket
++import time
++import unittest
++import uuid
++
++import agent
++
++
++class FakeWriter:
++    """Minimal StreamWriter stand-in for forward() tests."""
++
++    transport = None
++
++    def __init__(self):
++        self.written = b""
++        self.closed = False
++
++    def write(self, data):
++        self.written += data
++
++    async def drain(self):
++        pass
++
++    def close(self):
++        self.closed = True
++
++    async def wait_closed(self):
++        pass
++
++    def is_closing(self):
++        return self.closed
++
++
++class FakeTransport:
++    def __init__(self, sock):
++        self._sock = sock
++
++    def get_extra_info(self, name):
++        if name == "socket":
++            return self._sock
++        return None
++
++
++class FakeConnection:
++    def __init__(self, sock):
++        self.transport = FakeTransport(sock)
++
++
++class AgentLivenessTest(unittest.IsolatedAsyncioTestCase):
++    async def _serve(self, handler):
++        server = await asyncio.start_server(handler, "127.0.0.1", 0)
++        self.addAsyncCleanup(self._close_server, server)
++        return server.sockets[0].getsockname()[1]
++
++    async def _close_server(self, server):
++        server.close()
++        await server.wait_closed()
++
++    async def _free_port(self):
++        sock = socket.socket()
++        sock.bind(("127.0.0.1", 0))
++        port = sock.getsockname()[1]
++        sock.close()
++        return port
++
++    async def test_control_timeout_reconnects(self):
++        """A silent proxy must not leave the agent blocked forever."""
++        token = uuid.uuid4()
++
++        async def silent_proxy(reader, writer):
++            try:
++                await reader.readexactly(16)
++                await reader.read()  # never ping, wait for the agent to give up
++            finally:
++                writer.close()
++
++        port = await self._serve(silent_proxy)
++        queue = asyncio.Queue()
++
++        task = asyncio.create_task(
++            agent.run_agent(
++                token,
++                "127.0.0.1",
++                port,
++                "127.0.0.1",
++                1,
++                False,
++                None,
++                0.01,
++                0,
++                0.2,
++                queue,
++            )
++        )
++
++        replacement = await asyncio.wait_for(queue.get(), timeout=3)
++        await asyncio.wait_for(task, timeout=3)
++
++        self.assertEqual(replacement, 1)
++        self.assertEqual(queue.qsize(), 0, "exactly one replacement must be queued")
++
++    async def test_handshake_failure_queues_single_replacement(self):
++        """The handshake-failure branch and finally must not both queue a replacement."""
++
++        async def bogus_proxy(reader, writer):
++            try:
++                await reader.readexactly(16)
++                writer.write(b"bogus!!")
++                await writer.drain()
++                await reader.read()
++            finally:
++                writer.close()
++
++        port = await self._serve(bogus_proxy)
++        queue = asyncio.Queue()
++
++        await asyncio.wait_for(
++            agent.run_agent(
++                uuid.uuid4(),
++                "127.0.0.1",
++                port,
++                "127.0.0.1",
++                1,
++                False,
++                None,
++                0.01,
++                0,
++                1.0,
++                queue,
++            ),
++            timeout=3,
++        )
++
++        self.assertEqual(queue.qsize(), 1)
++
++    async def test_service_failure_queues_single_replacement(self):
++        """A failed local-service dial logs the real error and queues one replacement."""
++
++        async def connect_proxy(reader, writer):
++            try:
++                await reader.readexactly(16)
++                writer.write(b"connect")
++                await writer.drain()
++                await reader.read()
++            finally:
++                writer.close()
++
++        port = await self._serve(connect_proxy)
++        closed_port = await self._free_port()
++        queue = asyncio.Queue()
++
++        with self.assertLogs(level="ERROR") as captured:
++            await asyncio.wait_for(
++                agent.run_agent(
++                    uuid.uuid4(),
++                    "127.0.0.1",
++                    port,
++                    "127.0.0.1",
++                    closed_port,
++                    False,
++                    None,
++                    0.01,
++                    0,
++                    1.0,
++                    queue,
++                ),
++                timeout=3,
++            )
++
++        self.assertEqual(queue.qsize(), 1)
++        self.assertTrue(
++            any("service_connection_failed" in line for line in captured.output),
++            "the real service error must be logged",
++        )
++        self.assertFalse(
++            any("TypeError" in line for line in captured.output),
++            "the old gather/unpack TypeError must be gone",
++        )
++
++    async def test_silent_stream_survives_without_idle_timeout(self):
++        """With idle_timeout=0 a quiet stream stays open and delivers later bytes."""
++        reader = asyncio.StreamReader()
++        destination = FakeWriter()
++
++        async def feed_later():
++            await asyncio.sleep(0.3)
++            reader.feed_data(b"x")
++            reader.feed_eof()
++
++        feeder = asyncio.create_task(feed_later())
++        started = time.monotonic()
++
++        total = await agent.forward(
++            uuid.uuid4(),
++            "test",
++            ("127.0.0.1", 1),
++            reader,
++            destination,
++            0,
++        )
++
++        elapsed = time.monotonic() - started
++        await feeder
++
++        self.assertEqual(total, 1)
++        self.assertEqual(destination.written, b"x")
++        self.assertGreaterEqual(elapsed, 0.25)
++        self.assertTrue(destination.closed)
++
++    async def test_fragmented_connect_is_accepted(self):
++        """A `connect` split across TCP segments is still a valid frame."""
++        reader = asyncio.StreamReader()
++        task = asyncio.create_task(agent.read_control_frame(reader, 1))
++
++        reader.feed_data(b"con")
++        await asyncio.sleep(0.05)
++        reader.feed_data(b"nect")
++
++        self.assertEqual(await asyncio.wait_for(task, timeout=1), b"connect")
++
++    async def test_buffered_frames_are_not_glued(self):
++        """A buffered `ping` followed by `connect` must be read as two frames."""
++        reader = asyncio.StreamReader()
++        reader.feed_data(b"pingconnect")
++
++        self.assertEqual(await agent.read_control_frame(reader, 1), b"ping")
++        self.assertEqual(await agent.read_control_frame(reader, 1), b"connect")
++
++    async def test_control_frame_times_out(self):
++        reader = asyncio.StreamReader()
++
++        with self.assertRaises(asyncio.TimeoutError):
++            await agent.read_control_frame(reader, 0.1)
++
++    async def test_reconnect_delay_has_jitter(self):
++        for _ in range(20):
++            delay = agent.reconnect_delay(1.0)
++            self.assertGreaterEqual(delay, 1.0)
++            self.assertLessEqual(delay, 1.5)
++
++    async def test_failed_connection_closes_before_replacement(self):
++        """The failed socket must be closed before its successor is queued."""
++        active = {"now": 0}
++
++        async def bogus_proxy(reader, writer):
++            active["now"] += 1
++            try:
++                await reader.readexactly(16)
++                writer.write(b"bogus!!")
++                await writer.drain()
++                await reader.read()
++            except (asyncio.IncompleteReadError, ConnectionResetError):
++                pass
++            finally:
++                active["now"] -= 1
++                writer.close()
++
++        port = await self._serve(bogus_proxy)
++        queue = asyncio.Queue()
++
++        task = asyncio.create_task(
++            agent.run_agent(
++                uuid.uuid4(),
++                "127.0.0.1",
++                port,
++                "127.0.0.1",
++                1,
++                False,
++                None,
++                0.3,
++                0,
++                5.0,
++                queue,
++            )
++        )
++
++        self.assertEqual(await asyncio.wait_for(queue.get(), timeout=2), 1)
++        self.assertEqual(active["now"], 0, "a failed connection stayed open while its successor ran")
++        await asyncio.wait_for(task, timeout=2)
++
++    async def test_failures_do_not_accumulate_connections(self):
++        """AC-10: failures driven through spawn_agents must not grow live connections."""
++        state = {"now": 0, "max": 0, "accepted": 0}
++
++        async def bogus_proxy(reader, writer):
++            state["accepted"] += 1
++            state["now"] += 1
++            state["max"] = max(state["max"], state["now"])
++            try:
++                await reader.readexactly(16)
++                writer.write(b"bogus!!")
++                await writer.drain()
++                await reader.read()
++            except (asyncio.IncompleteReadError, ConnectionResetError):
++                pass
++            finally:
++                state["now"] -= 1
++                writer.close()
++
++        port = await self._serve(bogus_proxy)
++        queue = asyncio.Queue()
++        await queue.put(1)
++        spawner = asyncio.create_task(
++            agent.spawn_agents(
++                queue,
++                "127.0.0.1",
++                port,
++                "127.0.0.1",
++                1,
++                False,
++                None,
++                0.1,
++                0,
++                5.0,
++            )
++        )
++
++        try:
++            await asyncio.sleep(2.0)
++        finally:
++            spawner.cancel()
++            await asyncio.gather(spawner, return_exceptions=True)
++            for task in asyncio.all_tasks():
++                if task.get_coro().__name__ == "run_agent":
++                    task.cancel()
++            await asyncio.sleep(0)
++
++        self.assertGreaterEqual(state["accepted"], 3, "the harness must exercise several failures")
++        self.assertLessEqual(
++            state["max"],
++            2,
++            f"connections accumulated: max={state['max']} accepted={state['accepted']}",
++        )
++
++    async def test_retry_delay_applies_to_control_timeout(self):
++        """A silent proxy is followed by the jittered retry delay, not an immediate retry."""
++
++        async def silent_proxy(reader, writer):
++            try:
++                await reader.readexactly(16)
++                await reader.read()
++            finally:
++                writer.close()
++
++        port = await self._serve(silent_proxy)
++        queue = asyncio.Queue()
++        started = time.monotonic()
++
++        await asyncio.wait_for(
++            agent.run_agent(
++                uuid.uuid4(),
++                "127.0.0.1",
++                port,
++                "127.0.0.1",
++                1,
++                False,
++                None,
++                0.3,
++                0,
++                0.1,
++                queue,
++            ),
++            timeout=3,
++        )
++
++        elapsed = time.monotonic() - started
++        self.assertGreaterEqual(elapsed, 0.4, "control timeout did not back off before queueing")
++        self.assertEqual(queue.qsize(), 1)
++
++    async def test_retry_delay_applies_to_eof(self):
++        """A proxy that closes after the token is followed by the jittered retry delay."""
++
++        async def close_after_token(reader, writer):
++            try:
++                await reader.readexactly(16)
++            finally:
++                writer.close()
++
++        port = await self._serve(close_after_token)
++        queue = asyncio.Queue()
++        started = time.monotonic()
++
++        await asyncio.wait_for(
++            agent.run_agent(
++                uuid.uuid4(),
++                "127.0.0.1",
++                port,
++                "127.0.0.1",
++                1,
++                False,
++                None,
++                0.3,
++                0,
++                5.0,
++                queue,
++            ),
++            timeout=3,
++        )
++
++        elapsed = time.monotonic() - started
++        self.assertGreaterEqual(elapsed, 0.3, "EOF did not back off before queueing")
++        self.assertEqual(queue.qsize(), 1)
++
++    async def test_enable_keepalive_is_best_effort(self):
++        left, right = socket.socketpair()
++        try:
++            agent.enable_keepalive(FakeConnection(left))
++            self.assertEqual(left.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE), 1)
++        finally:
++            left.close()
++            right.close()
++
++        # None and a transport without a socket must be tolerated.
++        agent.enable_keepalive(None)
++        agent.enable_keepalive(FakeWriter())
++
++        # A real asyncio writer exposes a TransportSocket, not the raw socket;
++        # this is the shape that reaches enable_keepalive() in production.
++        async def handler(reader, writer):
++            await reader.read()
++            writer.close()
++
++        server = await asyncio.start_server(handler, "127.0.0.1", 0)
++        port = server.sockets[0].getsockname()[1]
++        reader, writer = await asyncio.open_connection("127.0.0.1", port)
++        try:
++            agent.enable_keepalive(writer)
++            sock = writer.transport.get_extra_info("socket")
++            self.assertEqual(sock.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE), 1)
++        finally:
++            writer.close()
++            await asyncio.gather(writer.wait_closed(), return_exceptions=True)
++            server.close()
++            await server.wait_closed()
++
++
++if __name__ == "__main__":
++    unittest.main()
