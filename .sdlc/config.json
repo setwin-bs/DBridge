@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "scm": "auto",
+  "git": {
+    "worktree": false
+  },
+  "github": {
+    "repo": "setwin-bs/DBridge",
+    "defaultBranch": "main"
+  },
+  "board": {
+    "checked": "2026-10-28",
+    "reason": "Skipped at the human's request; no project board is used for this repository.",
+    "defaults": {}
+  },
+  "commands": {
+    "test": null,
+    "lint": null,
+    "build": null,
+    "app": null
+  },
+  "guard": {
+    "protectedPaths": ["**/generated/**", "**/gen/**", "**/.env*"],
+    "testGlobs": ["**/*.test.*", "**/*.spec.*", "**/__tests__/**", "**/tests/**", "**/e2e/**"]
+  },
+  "docs": {
+    "agents": "all",
+    "disabled": [],
+    "promptContext": true
+  }
+}
