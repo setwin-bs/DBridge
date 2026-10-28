@@ -1,6 +1,6 @@
 ---
 artifact: release
-status: pre-PR
+status: in-review
 approved_by: ""
 approved_at: ""
 spec: "001"
