@@ -5,7 +5,7 @@ update_when:
   - a new domain term is introduced
   - a definition or its boundaries change
 validated_against: ["agent.py", "proxy.py"]
-verified_against: 6f1fec7
+verified_against: 31d14ba
 screenshots: false
 ---
 

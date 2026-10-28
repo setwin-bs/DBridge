@@ -9,7 +9,7 @@ update_when:
   - the deployment shape, images or CI publishing changes
   - an ADR is accepted
 validated_against: ["agent.py", "proxy.py", "docker-compose.yml", "Dockerfile.*", ".github/workflows/**"]
-verified_against: 6f1fec7
+verified_against: 31d14ba
 screenshots: false
 ---
 
@@ -20,8 +20,8 @@ DBridge carries database traffic between clients that cannot route to a tenant h
 database service that host runs. Two standalone asyncio processes do the work: `proxy.py`, which
 clients reach and which holds a pool of agent connections, and `agent.py`, which runs on the
 tenant host and dials out to the proxy. Neither process parses the database protocol; bytes are
-forwarded unchanged. Decisions and their rationale are not recorded as ADRs in this repository
-yet — see [ADR index](#adr-index).
+forwarded unchanged. Decisions that outlive an issue live in [`adrs/`](../adrs/); the liveness
+and idle-timeout policy is [ADR 0001](../adrs/0001-agent-connection-liveness.md).
 
 ## Context
 
@@ -327,6 +327,9 @@ Readiness carries a real status code, so an `httpGet` probe sees `503` on an emp
 
 ## ADR index
 
-This repository has no `adrs/` directory and no MADR files at `6f1fec7`. Structural decisions so
-far exist only in the issue artifacts under `.sdlc/issues/`; when the first ADR is accepted, add it
-here with its status.
+| ADR | Title | Status |
+|---|---|---|
+| [0001](../adrs/0001-agent-connection-liveness.md) | Detect a dead agent control connection with an application deadline | accepted |
+
+The template is [`adrs/0000-template.md`](../adrs/0000-template.md). A changed decision is a new
+ADR that supersedes the old one; the old file is never edited.

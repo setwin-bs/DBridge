@@ -6,7 +6,7 @@ update_when:
   - a doc's audience, update triggers or validated_against globs change
   - conventions.md, the audience registry or the docs fleet changes
 validated_against: ["docs/**", "agent.py", "proxy.py"]
-verified_against: 6f1fec7
+verified_against: 31d14ba
 screenshots: false
 ---
 

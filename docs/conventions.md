@@ -7,7 +7,7 @@ update_when:
   - a visual theme or an accessibility standard enters the product
   - a question comes back a second time
 validated_against: ["AGENTS.md", "agent.py", "proxy.py"]
-verified_against: 6f1fec7
+verified_against: 31d14ba
 screenshots: false
 ---
 

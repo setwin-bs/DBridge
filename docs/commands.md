@@ -5,7 +5,7 @@ update_when:
   - a command, script, workflow or listening port is added, changed or removed
   - flags, arguments or defaults change
 validated_against: ["proxy.py", "agent.py", ".github/workflows/**", "docker-compose.yml", "Dockerfile.*"]
-verified_against: 6f1fec7
+verified_against: 31d14ba
 screenshots: false
 ---
 

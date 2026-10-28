@@ -7,7 +7,7 @@ update_when:
   - a Dockerfile changes a default baked into an image
   - a validation rule changes
 validated_against: ["agent.py", "proxy.py", "Dockerfile.proxy", "Dockerfile.agent", "docker-compose.yml"]
-verified_against: 6f1fec7
+verified_against: 31d14ba
 screenshots: false
 ---
 

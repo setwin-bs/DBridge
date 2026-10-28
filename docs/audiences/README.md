@@ -6,7 +6,7 @@ update_when:
   - an audience's role, technical level or docs change
   - the audience contract or the validation rule changes
 validated_against: ["docs/**"]
-verified_against: 6f1fec7
+verified_against: 31d14ba
 screenshots: false
 ---
 
