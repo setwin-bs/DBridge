@@ -1,0 +1,9 @@
+## periodic pool_size lines (INFO)
+2026-10-28 13:44:39,973 INFO agent=1f757a14-4748-41ba-b3b0-cfd642b3d8bf pool_size=1
+2026-10-28 13:44:40,837 INFO pool_size=1
+2026-10-28 13:44:41,924 INFO agent=2f649ce1-ff82-4585-9ba3-f57d77e61f2c pool_size=1
+2026-10-28 13:44:41,942 INFO agent=e3e4fecf-3f41-4830-8076-d15923e04d56 pool_size=1
+2026-10-28 13:44:42,839 INFO pool_size=1
+## timestamped log format
+2026-10-28 13:44:38,835 INFO proxy_started host=0.0.0.0 agents_port=7111 clients_port=9111
+2026-10-28 13:44:39,603 WARNING agent_peer=127.0.0.1:39538 handshake_failed reason=short_token bytes=3

@@ -1,0 +1,15 @@
+## registrations on the fresh proxy
+1
+ready
+http=200
+## echo after the restart
+again
+## agent reconnect evidence
+2026-10-28 13:45:16,291 INFO agent=e3e4fecf-3f41-4830-8076-d15923e04d56 state=closed_by_proxy proxy=127.0.0.1:7111
+2026-10-28 13:45:16,840 ERROR agent=17455886-66d4-4f6e-81c0-6c345db48131 connection_error exception=ConnectionRefusedError(111, "Connect call failed ('127.0.0.1', 7111)") retry_delay=0.50s
+2026-10-28 13:45:17,478 ERROR agent=e71ed18e-e560-49c1-bff0-899a77827d3c connection_error exception=ConnectionRefusedError(111, "Connect call failed ('127.0.0.1', 7111)") retry_delay=0.50s
+2026-10-28 13:45:18,253 ERROR agent=f0ed0d57-3095-4497-a225-d0baafb4d34c connection_error exception=ConnectionRefusedError(111, "Connect call failed ('127.0.0.1', 7111)") retry_delay=0.50s
+2026-10-28 13:45:18,965 ERROR agent=787121b5-3a54-41fa-b926-b49c85045097 connection_error exception=ConnectionRefusedError(111, "Connect call failed ('127.0.0.1', 7111)") retry_delay=0.50s
+2026-10-28 13:45:19,960 ERROR agent=d3bb07bd-d59d-4d93-8e19-08e25ffb3cc3 connection_error exception=ConnectionRefusedError(111, "Connect call failed ('127.0.0.1', 7111)") retry_delay=0.50s
+2026-10-28 13:45:20,575 INFO agent=0031f081-f9b3-448c-adc4-c58261ec76a0 state=connected proxy=127.0.0.1:7111 ssl=False
+2026-10-28 13:45:23,311 INFO agent=73c8874a-514d-4772-8c55-1369b1f981e7 state=connected proxy=127.0.0.1:7111 ssl=False

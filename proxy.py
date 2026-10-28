@@ -25,6 +25,50 @@ def writer_peer(writer: asyncio.StreamWriter | None) -> tuple[str, int] | None:
     return transport.get_extra_info('peername')
 
 
+def configure_logging(level: str) -> None:
+    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(message)s")
+    logging.Formatter.converter = time.gmtime  # timestamps in UTC
+
+
+async def close_writer(writer: asyncio.StreamWriter | None, timeout: float = 5.0) -> None:
+    """Close a writer without letting a dead peer wedge the caller."""
+    if writer is None:
+        return
+
+    writer.close()
+    try:
+        await asyncio.wait_for(writer.wait_closed(), timeout=timeout)
+    except (asyncio.TimeoutError, OSError):
+        pass
+
+
+async def await_ready(reader: asyncio.StreamReader, timeout: float) -> bytes:
+    """Wait for an agent's `ready`, discarding a stale keepalive `pong`."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise asyncio.TimeoutError
+
+        head = await asyncio.wait_for(reader.readexactly(4), timeout=remaining)
+
+        if head == b"pong":
+            continue
+
+        if head == b"read":
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            tail = await asyncio.wait_for(reader.readexactly(1), timeout=remaining)
+            if tail == b"y":
+                return b"ready"
+            return head + tail
+
+        return head
+
+
 class Agent:
     token: uuid.UUID
 
@@ -106,8 +150,27 @@ class Context:
             return len(self.agents)
 
     async def add_agent(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, ping_pong_interval: float):
-        token = uuid.UUID(bytes=await reader.read(16))
         agent_peer = writer_peer(writer)
+
+        try:
+            token_bytes = await asyncio.wait_for(reader.readexactly(16), timeout=10)
+        except asyncio.IncompleteReadError as exc:
+            logging.warning(
+                "agent_peer=%s handshake_failed reason=short_token bytes=%d",
+                format_peer(agent_peer),
+                len(exc.partial),
+            )
+            await close_writer(writer)
+            return
+        except (asyncio.TimeoutError, ConnectionResetError, OSError):
+            logging.warning(
+                "agent_peer=%s handshake_failed reason=handshake_error",
+                format_peer(agent_peer),
+            )
+            await close_writer(writer)
+            return
+
+        token = uuid.UUID(bytes=token_bytes)
         logging.info("agent=%s state=registered peer=%s", token, format_peer(agent_peer))
 
         agent = Agent(token, reader, writer, ping_pong_interval)
@@ -115,7 +178,9 @@ class Context:
 
         async with self.lock:
             self.agents.append(agent)
-            logging.debug("agent=%s pool_size=%d", token, len(self.agents))
+            pool_size = len(self.agents)
+
+        logging.info("agent=%s pool_size=%d", token, pool_size)
 
     async def clean_zombies(self, sleep_interval: float):
         while True:
@@ -134,16 +199,21 @@ class Context:
                         async with self.lock:
                             self.agents.remove(agent)  # 🗑 discarding!
 
-                        agent.writer.close()
-                        closing_zombies.append(agent.writer.wait_closed())
+                        closing_zombies.append(close_writer(agent.writer))
 
                     except ValueError:  # agent already popped by another thread...
                         logging.debug("agent=%s zombie_already_removed", agent.token)
 
             await asyncio.gather(*closing_zombies, return_exceptions=True)
 
-            if len(closing_zombies) > 0:
-                logging.info("cleaned_zombie_agents=%d", len(closing_zombies))
+            if closing_zombies:
+                async with self.lock:
+                    pool_size = len(self.agents)
+                logging.info(
+                    "cleaned_zombie_agents=%d pool_size=%d",
+                    len(closing_zombies),
+                    pool_size,
+                )
 
     async def pop_agent(self) -> Agent | None:
         while True:
@@ -157,13 +227,19 @@ class Context:
             await agent.stop_ping_pong()
 
             if agent.reader.at_eof() or agent.writer.is_closing():
-                logging.info("agent=%s state=zombie_discarded", agent.token)
-                agent.writer.close()
-                await asyncio.gather(agent.writer.wait_closed(), return_exceptions=True)
+                logging.info("agent=%s state=zombie_discarded pool_size=%d", agent.token, pool_size)
+                await close_writer(agent.writer)
                 continue
 
             logging.info("agent=%s state=assigned remaining_pool=%d", agent.token, pool_size)
             return agent
+
+    async def report_pool(self, interval: float):
+        while True:
+            await asyncio.sleep(interval)
+            async with self.lock:
+                pool_size = len(self.agents)
+            logging.info("pool_size=%d", pool_size)
 
 
 context = Context()
@@ -213,6 +289,26 @@ def validate_wait_agent_retry_interval(value):
         f_value = float(value)
         if f_value <= 0 or f_value > 300:
             raise argparse.ArgumentTypeError("must be > 0 and <= 300")
+        return f_value
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Invalid float value.") from exc
+
+
+def validate_ready_timeout(value):
+    try:
+        f_value = float(value)
+        if f_value <= 0 or f_value > 300:
+            raise argparse.ArgumentTypeError("must be > 0 and <= 300")
+        return f_value
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Invalid float value.") from exc
+
+
+def validate_pool_report_interval(value):
+    try:
+        f_value = float(value)
+        if f_value < 0 or f_value > 300:
+            raise argparse.ArgumentTypeError("must be >= 0 and <= 300")
         return f_value
     except ValueError as exc:
         raise argparse.ArgumentTypeError("Invalid float value.") from exc
@@ -306,7 +402,17 @@ def parse_args() -> argparse.Namespace:
     default_forward_idle_timeout_seconds = parse(
         to=float,
         value=os.getenv("FORWARD_IDLE_TIMEOUT_SECONDS"),
-        or_default=300.0,
+        or_default=0.0,
+    )
+    default_ready_timeout_seconds = parse(
+        to=float,
+        value=os.getenv("READY_TIMEOUT_SECONDS"),
+        or_default=30.0,
+    )
+    default_pool_report_interval_seconds = parse(
+        to=float,
+        value=os.getenv("POOL_REPORT_INTERVAL_SECONDS"),
+        or_default=60.0,
     )
 
     default_log_level = os.getenv("LOG_LEVEL", "INFO")
@@ -423,6 +529,26 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--ready-timeout",
+        type=validate_ready_timeout,
+        default=default_ready_timeout_seconds,
+        help=(
+            "Seconds to wait for an agent to answer `ready` after `connect` before aborting "
+            f"the bridge (default: {default_ready_timeout_seconds:.0f}s)."
+        ),
+    )
+
+    parser.add_argument(
+        "--pool-report-interval",
+        type=validate_pool_report_interval,
+        default=default_pool_report_interval_seconds,
+        help=(
+            "Seconds between periodic `pool_size` log lines. Set to 0 to disable "
+            f"(default: {default_pool_report_interval_seconds:.0f}s)."
+        ),
+    )
+
+    parser.add_argument(
         "-v", "--log-level",
         type=validate_log_level,
         default=default_log_level,
@@ -514,8 +640,7 @@ async def forward(
         )
 
     finally:
-        destination.close()
-        await destination.wait_closed()
+        await close_writer(destination)
 
     return total_bytes
 
@@ -524,21 +649,36 @@ async def handle_liveness(_reader: asyncio.StreamReader, writer: asyncio.StreamW
     writer.write("🚀 alive and forwarding packets like a champ!".encode())
     await writer.drain()
 
-    writer.close()
-    await writer.wait_closed()
+    await close_writer(writer)
 
 
-async def handle_readiness(_reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-    if await context.length() == 0:
-        message = "⚠️ not ready! waiting for agents to join..."
-    else:
-        message = "🚀 ready to forward packets like a pro!"
+async def handle_readiness(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    # Consume the request (an httpGet probe sends one; a tcpSocket probe does not).
+    try:
+        await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=2)
+    except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, asyncio.TimeoutError, OSError):
+        pass
 
-    writer.write(message.encode("utf-8"))
-    await writer.drain()
+    ready = await context.length() > 0
+    status = "200 OK" if ready else "503 Service Unavailable"
+    body = "ready" if ready else "not ready"
 
-    writer.close()
-    await writer.wait_closed()
+    response = (
+        f"HTTP/1.1 {status}\r\n"
+        "Content-Type: text/plain; charset=utf-8\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        f"{body}"
+    )
+
+    try:
+        writer.write(response.encode("utf-8"))
+        await writer.drain()
+    except OSError:
+        pass
+
+    await close_writer(writer)
 
 
 async def handle_agent(
@@ -570,6 +710,7 @@ async def handle_client(
     wait_agent_max_tries: int,
     wait_agent_retry_interval: float,
     forward_idle_timeout: float,
+    ready_timeout: float,
 ):
     client_peername = writer.transport.get_extra_info('peername')
 
@@ -619,8 +760,7 @@ async def handle_client(
         )
 
     if not agent:
-        writer.close()
-        await writer.wait_closed()
+        await close_writer(writer)
         return
 
     agent.writer.write(b"connect")
@@ -628,19 +768,26 @@ async def handle_client(
 
     agent_peername = agent.writer.transport.get_extra_info('peername')
 
-    if await agent.reader.read(5) != b"ready":
+    ready = None
+    reason = "agent_not_ready"
+    try:
+        ready = await await_ready(agent.reader, ready_timeout)
+    except asyncio.TimeoutError:
+        reason = "agent_not_ready_timeout"
+    except (asyncio.IncompleteReadError, OSError):
+        reason = "agent_not_ready_closed"
+
+    if ready != b"ready":
         logging.error(
-            "bridge_aborted agent_token=%s client_peer=%s reason=agent_not_ready",
+            "bridge_aborted agent_token=%s client_peer=%s reason=%s",
             agent.token,
             format_peer(client_peername),
+            reason,
         )
-        writer.close()
-        agent.writer.close()
 
         await asyncio.gather(
-            writer.wait_closed(),
-            agent.writer.wait_closed(),
-            return_exceptions=True
+            close_writer(writer),
+            close_writer(agent.writer),
         )
 
         return
@@ -694,13 +841,9 @@ async def handle_client(
             format_peer(client_peername),
         )
 
-        agent.writer.close()
-        writer.close()
-
         await asyncio.gather(
-            agent.writer.wait_closed(),
-            writer.wait_closed(),
-            return_exceptions=True
+            close_writer(agent.writer),
+            close_writer(writer),
         )
 
 
@@ -715,8 +858,7 @@ async def shutdown(loop, servers: tuple):
         agent = await context.pop_agent()
 
         if agent:
-            agent.writer.close()
-            closing_sockets.append(agent.writer.wait_closed())
+            closing_sockets.append(close_writer(agent.writer))
 
     for server in servers:
         server.close()
@@ -735,7 +877,7 @@ async def main():
     args = parse_args()
     loop = asyncio.get_running_loop()
 
-    logging.basicConfig(level=args.log_level, format="%(message)s")
+    configure_logging(args.log_level)
 
     ssl_context = None
     if args.ssl:
@@ -766,6 +908,7 @@ async def main():
                 args.wait_agent_max_tries,
                 args.wait_agent_retry_interval,
                 args.forward_idle_timeout,
+                args.ready_timeout,
             ),
             args.host,
             args.port_clients,
@@ -775,6 +918,9 @@ async def main():
 
     if args.zombies_clean_interval > 0:
         asyncio.create_task(context.clean_zombies(args.zombies_clean_interval))
+
+    if args.pool_report_interval > 0:
+        asyncio.create_task(context.report_pool(args.pool_report_interval))
 
     try:
         logging.info(

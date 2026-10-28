@@ -2,6 +2,8 @@ import os
 import argparse
 import asyncio
 import logging
+import random
+import socket
 import typing
 import uuid
 import ssl
@@ -26,6 +28,90 @@ def writer_peer(writer: asyncio.StreamWriter | None) -> tuple[str, int] | None:
         return None
 
     return transport.get_extra_info('peername')
+
+
+def configure_logging(level: str) -> None:
+    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(message)s")
+    logging.Formatter.converter = time.gmtime  # timestamps in UTC
+
+
+def reconnect_delay(base_seconds: float) -> float:
+    """Keep the configured retry delay and add jitter so agents never sync up."""
+    return base_seconds + random.uniform(0, 0.5)
+
+
+def enable_keepalive(
+    writer: asyncio.StreamWriter | None,
+    idle_seconds: int = 30,
+    interval_seconds: int = 10,
+    count: int = 3,
+) -> None:
+    """Best-effort OS keepalive; the application deadline is the real guarantee."""
+    if writer is None or writer.transport is None:
+        return
+
+    sock = writer.transport.get_extra_info("socket")
+    if sock is None:
+        return
+
+    # transport.get_extra_info("socket") is an asyncio TransportSocket wrapper,
+    # which does not expose ioctl(); the raw socket does.
+    raw = getattr(sock, "_sock", sock)
+
+    try:
+        raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+
+        if hasattr(socket, "SIO_KEEPALIVE_VALS") and hasattr(raw, "ioctl"):  # Windows
+            raw.ioctl(
+                socket.SIO_KEEPALIVE_VALS,
+                (1, idle_seconds * 1000, interval_seconds * 1000),
+            )
+        elif hasattr(socket, "TCP_KEEPIDLE"):  # Linux
+            raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, idle_seconds)
+            raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, interval_seconds)
+            raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, count)
+
+    except (OSError, AttributeError, ValueError) as exc:
+        logging.debug("keepalive_not_tuned exception=%r", exc)
+
+
+async def close_writer(writer: asyncio.StreamWriter | None, timeout: float = 5.0) -> None:
+    """Close a writer without letting a dead peer wedge the caller."""
+    if writer is None:
+        return
+
+    writer.close()
+    try:
+        await asyncio.wait_for(writer.wait_closed(), timeout=timeout)
+    except (asyncio.TimeoutError, OSError):
+        pass
+
+
+async def read_control_frame(reader: asyncio.StreamReader, timeout: float) -> bytes:
+    """Read exactly one control frame (`ping` or `connect`) within the deadline.
+
+    Reads an exact prefix first: `read(n)` may return several frames at once, so a
+    buffered `ping` followed by `connect` must not be glued into `pingcon`.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+
+    remaining = deadline - loop.time()
+    if remaining <= 0:
+        raise asyncio.TimeoutError
+
+    head = await asyncio.wait_for(reader.readexactly(4), timeout=remaining)
+
+    if head == b"ping":
+        return head
+
+    if head == b"conn":
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise asyncio.TimeoutError
+        return head + await asyncio.wait_for(reader.readexactly(3), timeout=remaining)
+
+    return head
 
 
 def parse(to: typing.Type[T], value: typing.Any, or_default: T | None = None) -> T | None:
@@ -83,6 +169,16 @@ def validate_idle_timeout(value):
         raise argparse.ArgumentTypeError("Invalid float value.") from exc
 
 
+def validate_control_idle_timeout(value):
+    try:
+        f_value = float(value)
+        if f_value <= 0 or f_value > 300:
+            raise argparse.ArgumentTypeError("must be > 0 and <= 300")
+        return f_value
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Invalid float value.") from exc
+
+
 def validate_log_level(value: str):
     value = value.upper()
     log_levels = logging.getLevelNamesMapping()
@@ -106,7 +202,12 @@ def parse_args():
 
     default_min_threads = parse(to=int, value=os.getenv("MIN_THREADS", os.cpu_count()), or_default=1)
     default_retry_delay_seconds = parse(to=float, value=os.getenv("RETRY_DELAY_SECONDS"), or_default=1.0)
-    default_forward_idle_timeout = parse(to=float, value=os.getenv("FORWARD_IDLE_TIMEOUT_SECONDS"), or_default=15.0)
+    default_forward_idle_timeout = parse(to=float, value=os.getenv("FORWARD_IDLE_TIMEOUT_SECONDS"), or_default=0.0)
+    default_control_idle_timeout = parse(
+        to=float,
+        value=os.getenv("CONTROL_IDLE_TIMEOUT_SECONDS"),
+        or_default=45.0,
+    )
 
     default_log_level = os.getenv("LOG_LEVEL", "INFO")
 
@@ -177,6 +278,17 @@ def parse_args():
             "Maximum seconds of inactivity allowed on a data stream before the agent closes the "
             "connection. Set to 0 to disable idle timeout (default: %.0fs)."
         ) % default_forward_idle_timeout,
+    )
+
+    parser.add_argument(
+        "--control-idle-timeout",
+        type=validate_control_idle_timeout,
+        default=default_control_idle_timeout,
+        help=(
+            "Seconds the agent waits for the proxy's next ping before closing the control "
+            "connection and reconnecting. Must be greater than the proxy's ping interval "
+            f"(default: {default_control_idle_timeout:.0f}s)."
+        ),
     )
 
     parser.add_argument(
@@ -266,8 +378,7 @@ async def forward(
         )
 
     finally:
-        destination.close()
-        await destination.wait_closed()
+        await close_writer(destination)
 
     return total_bytes
 
@@ -290,26 +401,46 @@ async def run_agent(
     cert,
     retry_delay_seconds,
     forward_idle_timeout,
+    control_idle_timeout,
     queue: asyncio.Queue,
 ):
     proxy_writer = None
     svc_writer = None
+    replacement_queued = False
 
-    new_agent_spawned = False
+    async def queue_replacement():
+        """Queue exactly one replacement for this control connection."""
+        nonlocal replacement_queued
+        if replacement_queued:
+            return
+        replacement_queued = True
+        await queue.put(1)
 
     try:
         ssl_context = ssl.create_default_context(cafile=cert) if use_ssl else None
         proxy_reader, proxy_writer = await asyncio.open_connection(proxy_host, proxy_port, ssl=ssl_context)
+        enable_keepalive(proxy_writer)
+
         proxy_peername = writer_peer(proxy_writer)
         logging.info("agent=%s state=connected proxy=%s ssl=%s", token, format_peer(proxy_peername), bool(use_ssl))
 
         proxy_writer.write(token.bytes)  # Send my identification
         await proxy_writer.drain()
 
-        data = None
-
         while True:
-            data = await proxy_reader.read(7)
+            try:
+                data = await read_control_frame(proxy_reader, control_idle_timeout)
+            except asyncio.TimeoutError:
+                logging.warning(
+                    "agent=%s state=control_timeout idle_seconds=%.0f proxy=%s",
+                    token,
+                    control_idle_timeout,
+                    format_peer(proxy_peername),
+                )
+                return
+            except asyncio.IncompleteReadError:
+                logging.info("agent=%s state=closed_by_proxy proxy=%s", token, format_peer(proxy_peername))
+                return
 
             if data != b"ping":
                 break
@@ -319,28 +450,24 @@ async def run_agent(
 
         if data != b"connect":
             logging.error("agent=%s handshake_failed payload=%r", token, data)
-
-            proxy_writer.close()
-
-            await asyncio.gather(
-                proxy_writer.wait_closed(),
-                asyncio.sleep(retry_delay_seconds),
-                queue.put(1)  # Signal to spawn a new agent
-            )
-
             return
 
         logging.info("agent=%s bridge=preparing service=%s:%d", token, svc_host, svc_port)
 
-        _, svc = await asyncio.gather(
-            queue.put(1),  # Signal to spawn a new agent,
-            asyncio.open_connection(svc_host, svc_port),
-            return_exceptions=True
-        )
+        # Refill the pool before bridging: this connection is busy from now on.
+        await queue_replacement()
 
-        new_agent_spawned = True
-
-        svc_reader, svc_writer = svc
+        try:
+            svc_reader, svc_writer = await asyncio.open_connection(svc_host, svc_port)
+        except OSError as exc:
+            logging.error(
+                "agent=%s service_connection_failed service=%s:%d exception=%r",
+                token,
+                svc_host,
+                svc_port,
+                exc,
+            )
+            return
 
         proxy_writer.write(b"ready")
         await proxy_writer.drain()
@@ -377,32 +504,27 @@ async def run_agent(
                 format_peer(svc_peername),
             )
 
-            svc_writer.close()
-            proxy_writer.close()
-
             await asyncio.gather(
-                svc_writer.wait_closed(),
-                proxy_writer.wait_closed(),
-                return_exceptions=True
+                close_writer(svc_writer),
+                close_writer(proxy_writer),
             )
+            return
 
     except Exception as e:
         logging.error("agent=%s connection_error exception=%r retry_delay=%.2fs", token, e, retry_delay_seconds)
-        await asyncio.sleep(retry_delay_seconds)
 
     finally:
         logging.info("agent=%s state=closed", token)
 
-        if proxy_writer:
-            proxy_writer.close()
-            # await proxy_writer.wait_closed()
+        # Close first: a failed connection must not stay open while its successor runs.
+        await close_writer(proxy_writer)
+        await close_writer(svc_writer)
 
-        if svc_writer:
-            svc_writer.close()
-            # await svc_writer.wait_closed()
-
-        if not new_agent_spawned:
-            await queue.put(1)  # Signal to spawn a new agent
+        if not replacement_queued:
+            # Failure before the bridge: back off before spawning the successor so
+            # consecutive failures cannot accumulate open connections.
+            await asyncio.sleep(reconnect_delay(retry_delay_seconds))
+            await queue_replacement()
 
 
 async def spawn_agents(queue: asyncio.Queue, *args):
@@ -433,7 +555,7 @@ async def shutdown(loop, health_server):
 
 async def main():
     args = parse_args()
-    logging.basicConfig(level=args.log_level, format="%(message)s")
+    configure_logging(args.log_level)
 
     loop = asyncio.get_running_loop()
     queue = asyncio.Queue()
@@ -458,6 +580,7 @@ async def main():
                 args.cert,
                 args.retry_delay_seconds,
                 args.forward_idle_timeout,
+                args.control_idle_timeout,
             )
         )
 
